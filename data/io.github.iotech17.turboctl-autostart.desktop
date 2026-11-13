@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Turbo Boost
+Comment=Turbo Boost tray icon
+Comment[fr]=Icône Turbo Boost dans la zone de notification
+Exec=@BINDIR@/turboctl-gui --tray
+Icon=turboctl
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

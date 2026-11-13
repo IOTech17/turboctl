@@ -1,0 +1,792 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""turboctl: tame Intel Turbo Boost instead of disabling it.
+
+Usage:
+  turboctl status                 show the CPU and the limits in place
+  turboctl monitor                temperature, power, ratio and active limit, once a second
+  turboctl apply [PROFILE]        apply PROFILE, or the saved profile
+  turboctl set PROFILE            apply and save PROFILE (off, cool, stock or custom)
+  turboctl undervolt MV           core and cache voltage offset, 0 to -100 mV
+  turboctl uvtest [FROM [TO]]     undervolt stability test, default -20 to -100 mV
+  turboctl serve                  JSON backend used by turboctl-gui
+  turboctl clean-shutdown         run at shutdown by turboctl-shutdown.service
+  turboctl --version
+
+Supported: Intel Core 4th to 10th generation (Haswell to Comet Lake), up to 8 cores.
+"""
+import errno
+import json
+import mmap
+import os
+import re
+import select
+import shutil
+import struct
+import subprocess
+import sys
+import time
+
+__version__ = "1.0.0"
+
+STATE_DIR = "/var/lib/turboctl"
+PROFILE_FILE = STATE_DIR + "/profile"
+CUSTOM_FILE = STATE_DIR + "/custom.json"
+UNDERVOLT_FILE = STATE_DIR + "/undervolt"
+# Holds "<boot id> <mV>" while an undervolt is active; removed at clean shutdown.
+UNDERVOLT_PENDING = STATE_DIR + "/undervolt-pending"
+# Holds the mV that was active when a boot ended without a clean shutdown.
+UNDERVOLT_CRASH = STATE_DIR + "/undervolt-crash"
+UVTEST_LOG = STATE_DIR + "/uvtest.log"
+# Factory limits, captured before turboctl's first write of each boot.
+FACTORY_FILE = "/run/turboctl/factory.json"
+
+NO_TURBO = "/sys/devices/system/cpu/intel_pstate/no_turbo"  # intel_pstate
+BOOST = "/sys/devices/system/cpu/cpufreq/boost"  # acpi-cpufreq
+LOCKDOWN = "/sys/kernel/security/lockdown"
+
+# Family 6 models whose registers below behave the same way. Ice Lake and later
+# encode the turbo ratio table differently, so they are left out.
+SUPPORTED_MODELS = {
+    0x3C: "Haswell",
+    0x45: "Haswell",
+    0x46: "Haswell",
+    0x3D: "Broadwell",
+    0x47: "Broadwell",
+    0x4E: "Skylake",
+    0x5E: "Skylake",
+    0x8E: "Kaby Lake / Coffee Lake / Whiskey Lake / Comet Lake",
+    0x9E: "Kaby Lake / Coffee Lake",
+    0xA5: "Comet Lake",
+    0xA6: "Comet Lake",
+}
+TESTED_MODELS = {0x47}
+MAX_CORES = 8  # MSR 0x1AD holds one byte per active-core count, up to 8
+
+MSR_PLATFORM_INFO = 0xCE
+MSR_VOLTAGE_OFFSET = 0x150
+MSR_PERF_STATUS = 0x198
+MSR_MISC_ENABLE = 0x1A0
+TURBO_DISABLE_BIT = 1 << 38
+MSR_TEMP_TARGET = 0x1A2
+MSR_TURBO_RATIO_LIMIT = 0x1AD
+MSR_PKG_THERM_STATUS = 0x1B1
+MSR_RAPL_UNIT = 0x606
+MSR_PKG_POWER_LIMIT = 0x610
+MSR_PKG_ENERGY = 0x611
+LIMIT_REASON_MSRS = (0x64F, 0x690)  # Skylake and later, then Haswell/Broadwell
+LIMIT_REASON_BITS = {0: "PROCHOT", 1: "THERMAL", 10: "PL1", 11: "PL2", 12: "MAX_TURBO"}
+
+MCHBAR_PCI_CONFIG = "/sys/bus/pci/devices/0000:00:00.0/config"
+MCHBAR_PL_OFFSET = 0x59A0  # MMIO mirror of the package power limits
+
+UNDERVOLT_PLANES = (0, 2)  # core and cache, which must share the same offset
+UNDERVOLT_MIN = -100
+
+UVTEST_STEP = 10
+UVTEST_MARGIN = 15
+# (name, stress-ng arguments, seconds); --verify turns silent miscalculations into failures.
+UVTEST_PHASES = (
+    ("all threads", ["--cpu", "0", "--cpu-method", "all", "--verify"], 300),
+    ("1 thread at max turbo", ["--cpu", "1", "--taskset", "0", "--cpu-method", "all", "--verify"], 180),
+    ("light load", ["--cpu", "0", "--cpu-load", "20", "--cpu-method", "all", "--verify"], 120),
+)
+# Too much undervolt often shows no MCE: a scheduler stall or a kernel WARNING
+# comes first, then a freeze. All of these count as a failure.
+KERNEL_ERROR = re.compile(
+    r"\bmce\b|machine check|hardware error|WARNING:|BUG:|Oops|general protection|lockup|rcu.*stall"
+    r"|sched_ext: .*disabled",
+    re.I,
+)
+
+
+class Unsupported(Exception):
+    """The CPU, the kernel or the firmware does not allow a feature."""
+
+
+# ---------------------------------------------------------------- low level
+
+
+def read_text(path):
+    with open(path) as f:
+        return f.read().strip()
+
+
+def write_text(path, text):
+    with open(path, "w") as f:
+        f.write(text)
+
+
+def remove(path):
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+def cpus():
+    return sorted(int(name[3:]) for name in os.listdir("/sys/devices/system/cpu") if re.fullmatch(r"cpu\d+", name))
+
+
+def core_cpus():
+    """Return one logical CPU per physical core."""
+    first = set()
+    for cpu in cpus():
+        siblings = read_text(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list")
+        first.add(int(re.split(r"[,-]", siblings)[0]))
+    return sorted(first)
+
+
+def rdmsr(reg, cpu=0):
+    fd = os.open(f"/dev/cpu/{cpu}/msr", os.O_RDONLY)
+    try:
+        return struct.unpack("<Q", os.pread(fd, 8, reg))[0]
+    finally:
+        os.close(fd)
+
+
+def wrmsr(reg, value):
+    for cpu in cpus():
+        fd = os.open(f"/dev/cpu/{cpu}/msr", os.O_WRONLY)
+        try:
+            os.pwrite(fd, struct.pack("<Q", value), reg)
+        except PermissionError as err:
+            raise OSError(
+                errno.EPERM, "the kernel refused an MSR write (msr.allow_writes=off or kernel lockdown)"
+            ) from err
+        finally:
+            os.close(fd)
+
+
+def ensure_msr():
+    if not os.path.exists("/dev/cpu/0/msr"):
+        subprocess.run(["modprobe", "msr"], check=False)
+    if not os.path.exists("/dev/cpu/0/msr"):
+        sys.exit("turboctl: /dev/cpu/0/msr is missing; the kernel needs CONFIG_X86_MSR")
+    try:
+        mode = read_text(LOCKDOWN)
+    except OSError:
+        return
+    if "[none]" not in mode:
+        sys.exit(f"turboctl: kernel lockdown is active ({mode}), MSR writes are blocked")
+
+
+# ---------------------------------------------------------------- CPU
+
+
+def detect_cpu():
+    """Return what this CPU is and what it lets us change, or exit if unsupported."""
+    fields = {}
+    for line in read_text("/proc/cpuinfo").split("\n\n")[0].splitlines():
+        key, _, value = line.partition(":")
+        fields[key.strip()] = value.strip()
+    model = int(fields.get("model", "0"))
+    name = fields.get("model name", "unknown CPU")
+    if fields.get("vendor_id") != "GenuineIntel" or fields.get("cpu family") != "6" or model not in SUPPORTED_MODELS:
+        sys.exit(
+            f"turboctl: {name} (model {model:#x}) is not supported; "
+            "supported CPUs are Intel Core 4th to 10th generation (Haswell to Comet Lake)"
+        )
+    cores = int(fields.get("cpu cores", "0"))
+    if not 1 <= cores <= MAX_CORES:
+        sys.exit(f"turboctl: {name} has {cores} cores; at most {MAX_CORES} are supported")
+
+    ensure_msr()
+    platform = rdmsr(MSR_PLATFORM_INFO)
+    tjmax = (rdmsr(MSR_TEMP_TARGET) >> 16) & 0xFF or 100
+    return {
+        "name": re.sub(r"\s+", " ", name),
+        "model": model,
+        "generation": SUPPORTED_MODELS[model],
+        "tested": model in TESTED_MODELS,
+        "cores": cores,
+        "tjmax": tjmax,
+        "base_ratio": (platform >> 8) & 0xFF,
+        "ratio_writable": bool(platform >> 28 & 1),
+        "tcc_writable": bool(platform >> 30 & 1),
+        "power_unit": 1 << (rdmsr(MSR_RAPL_UNIT) & 0xF),  # steps per watt
+    }
+
+
+def get_ratios(cpu):
+    value = rdmsr(MSR_TURBO_RATIO_LIMIT)
+    return [(value >> (8 * i)) & 0xFF for i in range(cpu["cores"])]
+
+
+def get_tcc(cpu):
+    return cpu["tjmax"] - ((rdmsr(MSR_TEMP_TARGET) >> 24) & 0x3F)
+
+
+def msr_pl1(cpu):
+    return (rdmsr(MSR_PKG_POWER_LIMIT) & 0x7FFF) / cpu["power_unit"]
+
+
+def mchbar_base():
+    with open(MCHBAR_PCI_CONFIG, "rb") as f:
+        value = struct.unpack("<Q", f.read(0x50)[0x48:0x50])[0]
+    if not value & 1:
+        raise Unsupported("MCHBAR is disabled by the firmware")
+    return value & 0x7FFFFF8000
+
+
+def power_limits(cpu, write_watts=None):
+    """Return (PL1 W, PL2 W) from the MCHBAR mirror, optionally setting PL1 first.
+
+    MSR 0x610 is often locked by the firmware; this mirror usually is not,
+    and the CPU enforces the lower of the two.
+    """
+    address = mchbar_base() + MCHBAR_PL_OFFSET
+    page, index = address & ~0xFFF, (address & 0xFFF) // 4
+    try:
+        fd = os.open("/dev/mem", (os.O_RDWR if write_watts else os.O_RDONLY) | os.O_SYNC)
+    except PermissionError as err:
+        raise Unsupported("/dev/mem access refused; boot with iomem=relaxed") from err
+    prot = mmap.PROT_READ | (mmap.PROT_WRITE if write_watts else 0)
+    try:
+        try:
+            area = mmap.mmap(fd, 4096, mmap.MAP_SHARED, prot, offset=page)
+        except OSError as err:
+            raise Unsupported(
+                "the kernel refused to map MCHBAR (CONFIG_IO_STRICT_DEVMEM); boot with iomem=relaxed"
+            ) from err
+        regs = memoryview(area).cast("I")  # keeps accesses 32-bit wide
+        if write_watts:
+            regs[index] = (regs[index] & ~0x7FFF) | round(write_watts * cpu["power_unit"])
+        low, high = regs[index], regs[index + 1]
+        regs.release()
+        area.close()
+    finally:
+        os.close(fd)
+    return (low & 0x7FFF) / cpu["power_unit"], (high & 0x7FFF) / cpu["power_unit"]
+
+
+def get_turbo():
+    if os.path.exists(NO_TURBO):
+        return read_text(NO_TURBO) == "0"
+    return read_text(BOOST) == "1"
+
+
+def set_turbo(enabled):
+    if os.path.exists(NO_TURBO):
+        write_text(NO_TURBO, "0" if enabled else "1")
+    elif os.path.exists(BOOST):
+        write_text(BOOST, "1" if enabled else "0")
+    else:
+        raise OSError(errno.ENOENT, "no turbo switch (neither intel_pstate nor acpi-cpufreq boost)")
+
+
+def clear_turbo_disable_bit():
+    # Firmware can set this bit, which makes turbo impossible to enable.
+    misc = rdmsr(MSR_MISC_ENABLE)
+    if misc & TURBO_DISABLE_BIT:
+        wrmsr(MSR_MISC_ENABLE, misc & ~TURBO_DISABLE_BIT)
+
+
+# ---------------------------------------------------------------- profiles
+
+
+def factory_limits(cpu):
+    """Return the limits the firmware set at boot."""
+    try:
+        with open(FACTORY_FILE) as f:
+            factory = json.load(f)
+        if len(factory["ratios"]) == cpu["cores"]:
+            return factory
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    # Nothing written yet this boot, so the registers still hold the factory values.
+    return {"ratios": get_ratios(cpu), "tcc": get_tcc(cpu), "pl1": msr_pl1(cpu)}
+
+
+def record_factory_limits(cpu):
+    """Save the factory limits before the first write of this boot (/run is emptied at boot)."""
+    if not os.path.exists(FACTORY_FILE):
+        os.makedirs(os.path.dirname(FACTORY_FILE), exist_ok=True)
+        with open(FACTORY_FILE, "w") as f:
+            json.dump(factory_limits(cpu), f)
+
+
+def bounds(cpu, factory):
+    return {
+        "ratio": [cpu["base_ratio"], max(factory["ratios"])],
+        "pl1": [max(5, round(factory["pl1"] * 0.3)), int(factory["pl1"])],
+        "tcc": [max(60, cpu["tjmax"] - 35), cpu["tjmax"]],
+        "undervolt": [UNDERVOLT_MIN, 0],
+    }
+
+
+def build_profiles(cpu, factory):
+    stock = {"ratios": factory["ratios"], "pl1": int(factory["pl1"]), "tcc": factory["tcc"]}
+    limits = bounds(cpu, factory)
+    # "cool": one ratio step less per extra active core, 65 % of PL1, throttle 15 C below TjMax.
+    # On an i7-5700HQ this keeps a sustained all-core load around 85 C.
+    cool = {
+        "ratios": [max(cpu["base_ratio"], ratio - i) for i, ratio in enumerate(factory["ratios"])],
+        "pl1": max(limits["pl1"][0], int(factory["pl1"] * 0.65)),
+        "tcc": max(limits["tcc"][0], min(factory["tcc"], cpu["tjmax"] - 15)),
+    }
+    profiles = {
+        "off": dict(stock, turbo=False),
+        "cool": dict(cool, turbo=True),
+        "stock": dict(stock, turbo=True),
+    }
+    custom = load_custom(cpu, factory)
+    if custom:
+        profiles["custom"] = custom
+    return profiles
+
+
+def valid_profile(profile, cpu, factory):
+    if not isinstance(profile, dict):
+        return False
+    limits = bounds(cpu, factory)
+    ratios, pl1, tcc = profile.get("ratios"), profile.get("pl1"), profile.get("tcc")
+    low, high = limits["ratio"]
+    return (
+        isinstance(profile.get("turbo"), bool)
+        and isinstance(ratios, list)
+        and len(ratios) == cpu["cores"]
+        and all(type(r) is int and low <= r <= high for r in ratios)
+        and ratios == sorted(ratios, reverse=True)  # the CPU expects no rise with more active cores
+        and type(pl1) is int
+        and limits["pl1"][0] <= pl1 <= limits["pl1"][1]
+        and type(tcc) is int
+        and limits["tcc"][0] <= tcc <= limits["tcc"][1]
+    )
+
+
+def load_custom(cpu, factory):
+    try:
+        with open(CUSTOM_FILE) as f:
+            profile = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return profile if valid_profile(profile, cpu, factory) else None
+
+
+def saved_profile(profiles):
+    try:
+        name = read_text(PROFILE_FILE)
+    except OSError:
+        return "off"
+    return name if name in profiles else "off"
+
+
+def save_profile(name):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    write_text(PROFILE_FILE, name + "\n")
+
+
+def write_limits(cpu, profile):
+    if cpu["ratio_writable"]:
+        old = rdmsr(MSR_TURBO_RATIO_LIMIT)
+        mask = (1 << (8 * cpu["cores"])) - 1
+        wrmsr(MSR_TURBO_RATIO_LIMIT, (old & ~mask) | sum(r << (8 * i) for i, r in enumerate(profile["ratios"])))
+        if get_ratios(cpu) != profile["ratios"]:
+            raise OSError(errno.EIO, f"turbo ratios not applied, read {get_ratios(cpu)}")
+
+    if cpu["tcc_writable"]:
+        offset = cpu["tjmax"] - profile["tcc"]
+        wrmsr(MSR_TEMP_TARGET, (rdmsr(MSR_TEMP_TARGET) & ~(0x3F << 24)) | (offset << 24))
+        if get_tcc(cpu) != profile["tcc"]:
+            raise OSError(errno.EIO, f"throttle temperature not applied, read {get_tcc(cpu)} C")
+
+    set_pl1(cpu, profile["pl1"])
+
+
+def set_pl1(cpu, watts):
+    try:
+        applied = power_limits(cpu, watts)[0]
+    except Unsupported:
+        value = rdmsr(MSR_PKG_POWER_LIMIT)
+        if value >> 63:  # locked by the firmware: the MMIO mirror was the only way
+            raise
+        wrmsr(MSR_PKG_POWER_LIMIT, (value & ~0x7FFF) | round(watts * cpu["power_unit"]))
+        applied = msr_pl1(cpu)
+    if applied != watts:
+        raise OSError(errno.EIO, f"PL1 not applied, read {applied:g} W")
+
+
+def apply(cpu, profiles, name):
+    profile = profiles[name]
+    try:
+        record_factory_limits(cpu)
+        if profile["turbo"]:
+            clear_turbo_disable_bit()
+        # Turbo stays off until every limit is confirmed, and stays off on failure.
+        set_turbo(False)
+        write_limits(cpu, profile)
+        write_undervolt(checked_undervolt())
+        set_turbo(profile["turbo"])
+    except (OSError, Unsupported) as err:
+        sys.exit(f"turboctl: {getattr(err, 'strerror', None) or err}; turbo left disabled")
+
+
+# ---------------------------------------------------------------- undervolt
+
+
+def boot_id():
+    return read_text("/proc/sys/kernel/random/boot_id")
+
+
+def valid_undervolt(mv):
+    return type(mv) is int and UNDERVOLT_MIN <= mv <= 0
+
+
+def saved_undervolt():
+    try:
+        mv = int(read_text(UNDERVOLT_FILE))
+    except (OSError, ValueError):
+        return 0
+    return mv if valid_undervolt(mv) else 0
+
+
+def offset_units(mv):
+    """Encode millivolts as the 11-bit two's complement field of MSR 0x150 (1/1.024 mV steps)."""
+    return round(mv * 1.024) & 0x7FF
+
+
+def offset_mv(units):
+    return round((units - 0x800 if units & 0x400 else units) / 1.024)
+
+
+def read_voltage_offset(fd, plane):
+    os.pwrite(fd, struct.pack("<Q", 0x8000001000000000 | plane << 40), MSR_VOLTAGE_OFFSET)
+    return (struct.unpack("<Q", os.pread(fd, 8, MSR_VOLTAGE_OFFSET))[0] >> 21) & 0x7FF
+
+
+def get_undervolt():
+    fd = os.open("/dev/cpu/0/msr", os.O_RDWR)
+    try:
+        return offset_mv(read_voltage_offset(fd, UNDERVOLT_PLANES[0]))
+    finally:
+        os.close(fd)
+
+
+def write_undervolt(mv):
+    """Set the core and cache voltage offset and confirm it by reading it back."""
+    # Marker first: if this offset freezes the machine, the next boot finds it and skips it.
+    if mv:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(UNDERVOLT_PENDING, "w") as f:
+            f.write(f"{boot_id()} {mv}\n")
+            f.flush()
+            os.fsync(f.fileno())
+    units = offset_units(mv)
+    fd = os.open("/dev/cpu/0/msr", os.O_RDWR)
+    try:
+        for plane in UNDERVOLT_PLANES:
+            os.pwrite(fd, struct.pack("<Q", 0x8000001100000000 | plane << 40 | units << 21), MSR_VOLTAGE_OFFSET)
+            if read_voltage_offset(fd, plane) != units:
+                raise Unsupported("the firmware or microcode locks undervolting on this CPU")
+    finally:
+        os.close(fd)
+    if not mv:
+        remove(UNDERVOLT_PENDING)
+
+
+def checked_undervolt():
+    """Return the saved undervolt, reset to 0 if the previous boot died while undervolted."""
+    try:
+        marker = read_text(UNDERVOLT_PENDING).split()
+    except FileNotFoundError:
+        return saved_undervolt()
+    if marker and marker[0] == boot_id():
+        return saved_undervolt()  # same boot: resume from sleep or a plain re-apply
+    write_text(UNDERVOLT_CRASH, (marker[1] if len(marker) > 1 else "?") + "\n")
+    set_saved_undervolt(0)
+    remove(UNDERVOLT_PENDING)
+    return 0
+
+
+def undervolt_crash():
+    try:
+        return read_text(UNDERVOLT_CRASH)
+    except FileNotFoundError:
+        return None
+
+
+def set_saved_undervolt(mv):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    write_text(UNDERVOLT_FILE, f"{mv}\n")
+
+
+def set_undervolt(mv):
+    write_undervolt(mv)
+    set_saved_undervolt(mv)
+    remove(UNDERVOLT_CRASH)
+
+
+# ---------------------------------------------------------------- readings
+
+
+def package_temp(cpu):
+    return cpu["tjmax"] - ((rdmsr(MSR_PKG_THERM_STATUS) >> 16) & 0x7F)
+
+
+def power_sampler():
+    """Return a function giving the average package watts since its previous call."""
+    joule_per_count = 0.5 ** ((rdmsr(MSR_RAPL_UNIT) >> 8) & 0x1F)
+    last_energy, last_time = rdmsr(MSR_PKG_ENERGY) & 0xFFFFFFFF, time.monotonic()
+
+    def sample():
+        nonlocal last_energy, last_time
+        energy, now = rdmsr(MSR_PKG_ENERGY) & 0xFFFFFFFF, time.monotonic()
+        watts = ((energy - last_energy) & 0xFFFFFFFF) * joule_per_count / max(now - last_time, 1e-3)
+        last_energy, last_time = energy, now
+        return watts
+
+    return sample
+
+
+def active_limits():
+    for reg in LIMIT_REASON_MSRS:
+        try:
+            reasons = rdmsr(reg)
+        except OSError:
+            continue
+        return [name for bit, name in LIMIT_REASON_BITS.items() if reasons >> bit & 1]
+    return []
+
+
+def core_ratios():
+    return [(rdmsr(MSR_PERF_STATUS, c) >> 8) & 0xFF for c in core_cpus()]
+
+
+def status(cpu, profiles):
+    note = "" if cpu["tested"] else "  (untested generation)"
+    print(f"cpu           : {cpu['name']}, {cpu['generation']}, {cpu['cores']} cores{note}")
+    print(f"saved profile : {saved_profile(profiles)}")
+    print(f"turbo         : {'enabled' if get_turbo() else 'disabled'}")
+    ratios = " / ".join(f"{r / 10:.1f}" for r in get_ratios(cpu))
+    print(f"ratios 1-{cpu['cores']}c   : {ratios} GHz{'' if cpu['ratio_writable'] else ' (locked)'}")
+    try:
+        pl1, pl2 = power_limits(cpu)
+        print(f"PL1 / PL2     : {pl1:g} W / {pl2:g} W")
+    except (OSError, Unsupported) as err:
+        print(f"PL1 / PL2     : unavailable ({err})")
+    print(f"throttle at   : {get_tcc(cpu)} C (TjMax {cpu['tjmax']} C){'' if cpu['tcc_writable'] else ' (locked)'}")
+    print(f"undervolt     : {get_undervolt()} mV (saved {saved_undervolt()} mV)")
+    if undervolt_crash():
+        print(f"                reset to 0 after an unclean shutdown at {undervolt_crash()} mV")
+
+
+def monitor(cpu):
+    sample_watts = power_sampler()
+    print("temp_C watts ratio limits", flush=True)
+    while True:
+        time.sleep(1)
+        ratio = max(core_ratios())
+        print(f"{package_temp(cpu)} {sample_watts():.1f} {ratio} {','.join(active_limits()) or '-'}", flush=True)
+
+
+# ---------------------------------------------------------------- GUI backend
+
+
+def handle_request(cpu, factory, raw):
+    """Apply and save one JSON request from the GUI; return an error message or None."""
+    try:
+        request = json.loads(raw)
+        if "undervolt" in request:
+            if not valid_undervolt(request["undervolt"]):
+                return "undervolt out of range"
+            set_undervolt(request["undervolt"])
+            return None
+        if "custom" in request:
+            if not valid_profile(request["custom"], cpu, factory):
+                return "settings out of range"
+            os.makedirs(STATE_DIR, exist_ok=True)
+            with open(CUSTOM_FILE, "w") as f:
+                json.dump(request["custom"], f)
+            name = "custom"
+        else:
+            name = request["profile"]
+        profiles = build_profiles(cpu, factory)
+        if name not in profiles:
+            return "unknown profile"
+        apply(cpu, profiles, name)
+        save_profile(name)
+    except (ValueError, KeyError, TypeError) as err:
+        return f"invalid request: {err}"
+    except (OSError, Unsupported) as err:
+        return str(err)
+    except SystemExit as err:
+        return str(err.code)
+    return None
+
+
+def serve(cpu):
+    """Stream the state as JSON lines each second and apply requests read from stdin."""
+    factory = factory_limits(cpu)
+    sample_watts = power_sampler()
+    watts, error = 0.0, None
+    while True:
+        if select.select([0], [], [], 1)[0]:
+            data = os.read(0, 65536)
+            if not data:
+                return
+            for line in data.splitlines():
+                error = handle_request(cpu, factory, line)
+        else:
+            watts = sample_watts()
+        profiles = build_profiles(cpu, factory)
+        try:
+            pl1, pl2 = power_limits(cpu)
+        except (OSError, Unsupported):
+            pl1 = pl2 = None
+        state = {
+            "version": __version__,
+            "cpu": {k: cpu[k] for k in ("name", "generation", "tested", "cores", "tjmax")},
+            "writable": {"ratios": cpu["ratio_writable"], "tcc": cpu["tcc_writable"]},
+            "bounds": bounds(cpu, factory),
+            "profile": saved_profile(profiles),
+            "profiles": profiles,
+            "turbo": get_turbo(),
+            "ratios": get_ratios(cpu),
+            "pl1": pl1,
+            "pl2": pl2,
+            "tcc": get_tcc(cpu),
+            "temp": package_temp(cpu),
+            "watts": round(watts, 1),
+            "freqs": core_ratios(),
+            "limits": active_limits(),
+            "undervolt": saved_undervolt(),
+            "undervolt_crash": undervolt_crash(),
+            "error": error,
+        }
+        try:
+            print(json.dumps(state), flush=True)
+        except BrokenPipeError:
+            return
+
+
+# ---------------------------------------------------------------- uvtest
+
+
+def uvtest_log(message):
+    line = f"{time.strftime('%F %T')} {message}"
+    print(line, flush=True)
+    # Synced at once: after a freeze, the log shows the step that was running.
+    with open(UVTEST_LOG, "a") as f:
+        f.write(line + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def kernel_errors(since):
+    log = subprocess.run(
+        ["journalctl", "-k", "-q", "--no-pager", "--since", f"@{int(since)}"], capture_output=True, text=True
+    ).stdout
+    return [line for line in log.splitlines() if KERNEL_ERROR.search(line)]
+
+
+def stress_phase(stress_args, seconds):
+    """Run one stress-ng phase; return a failure description, or None if it passed."""
+    since, start = time.time(), time.monotonic()
+    try:
+        code = subprocess.run(["stress-ng", *stress_args, "--timeout", f"{seconds}s", "--quiet"]).returncode
+    except OSError as err:  # a corrupted kernel can refuse to start a program
+        return f"could not run stress-ng: {err}"
+    elapsed = time.monotonic() - start
+    errors = kernel_errors(since)
+    if code or errors or elapsed < seconds * 0.95:
+        return f"stress-ng exit {code}, {elapsed:.0f}/{seconds} s " + " | ".join(errors)
+    return None
+
+
+def uvtest(start, end):
+    """Step the undervolt down until a phase fails; the saved value is restored at the end."""
+    if not shutil.which("stress-ng"):
+        sys.exit("turboctl: uvtest needs stress-ng")
+    os.makedirs(STATE_DIR, exist_ok=True)
+    saved, stable = saved_undervolt(), None
+    uvtest_log(f"uvtest from {start} to {end} mV, log in {UVTEST_LOG}")
+    try:
+        for mv in range(start, end - 1, -UVTEST_STEP):
+            write_undervolt(mv)
+            for phase, stress_args, seconds in UVTEST_PHASES:
+                uvtest_log(f"{mv} mV: {phase}, {seconds} s")
+                failure = stress_phase(stress_args, seconds)
+                if failure:
+                    uvtest_log(f"{mv} mV: FAILED ({failure})")
+                    return
+            stable = mv
+            uvtest_log(f"{mv} mV: passed")
+    except KeyboardInterrupt:
+        uvtest_log("interrupted")
+    finally:
+        write_undervolt(saved)
+        uvtest_log(f"undervolt restored to the saved {saved} mV")
+        if stable is None:
+            uvtest_log("no step passed")
+        else:
+            # Margin unless every step up to the end passed.
+            advice = stable if stable == end else min(0, stable + UVTEST_MARGIN)
+            uvtest_log(f"last stable step {stable} mV, suggested setting {advice} mV")
+
+
+# ---------------------------------------------------------------- main
+
+
+def parse_mv(args, count):
+    try:
+        values = [int(a) for a in args]
+    except ValueError:
+        sys.exit(__doc__)
+    if len(values) > count or not all(valid_undervolt(v) for v in values):
+        sys.exit(f"turboctl: values must be between {UNDERVOLT_MIN} and 0 mV")
+    return values
+
+
+def main():
+    args = sys.argv[1:]
+    command = args[0] if args else ""
+    if command in ("--version", "-V"):
+        print(f"turboctl {__version__}")
+        return
+    commands = ("status", "monitor", "serve", "apply", "set", "undervolt", "uvtest", "clean-shutdown")
+    if command not in commands or len(args) > (3 if command == "uvtest" else 2):
+        sys.exit(__doc__)
+    if os.geteuid() != 0:
+        sys.exit("turboctl: must run as root")
+    if command == "clean-shutdown":
+        remove(UNDERVOLT_PENDING)
+        return
+
+    cpu = detect_cpu()
+    try:
+        if command == "undervolt":
+            values = parse_mv(args[1:], 1)
+            if not values:
+                sys.exit(__doc__)
+            set_undervolt(values[0])
+            print(f"undervolt {values[0]} mV applied")
+        elif command == "uvtest":
+            values = parse_mv(args[1:], 2)
+            start, end = (values + [-20, UNDERVOLT_MIN][len(values):])[:2]
+            if start < end:
+                sys.exit("turboctl: FROM must be above TO")
+            uvtest(start, end)
+        elif command == "status":
+            status(cpu, build_profiles(cpu, factory_limits(cpu)))
+        elif command == "monitor":
+            monitor(cpu)
+        elif command == "serve":
+            serve(cpu)
+        else:
+            profiles = build_profiles(cpu, factory_limits(cpu))
+            name = args[1] if len(args) == 2 else saved_profile(profiles)
+            if name not in profiles:
+                sys.exit(f"turboctl: profile must be one of {', '.join(profiles)}")
+            apply(cpu, profiles, name)
+            if command == "set":
+                save_profile(name)
+            print(f"profile {name} applied")
+    except Unsupported as err:
+        sys.exit(f"turboctl: {err}")
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

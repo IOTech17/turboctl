@@ -1,0 +1,147 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) YEAR turboctl contributors
+# This file is distributed under the same license as the turboctl package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, YEAR.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: turboctl\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2026-11-13 09:18+0000\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language-Team: LANGUAGE <LL@li.org>\n"
+"Language: \n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+#: turboctl-gui:38
+msgid "Turbo off"
+msgstr ""
+
+#: turboctl-gui:38
+msgid "Cool"
+msgstr ""
+
+#: turboctl-gui:38
+msgid "Stock"
+msgstr ""
+
+#: turboctl-gui:38
+msgid "Custom"
+msgstr ""
+
+#: turboctl-gui:40
+msgid "frequency ceiling"
+msgstr ""
+
+#: turboctl-gui:41
+msgid "power (PL1)"
+msgstr ""
+
+#: turboctl-gui:42
+msgid "power (PL2)"
+msgstr ""
+
+#: turboctl-gui:43
+msgid "temperature"
+msgstr ""
+
+#: turboctl-gui:298 turboctl-gui:332
+msgid "Turbo Boost"
+msgstr ""
+
+#: turboctl-gui:300
+msgid "Connecting…"
+msgstr ""
+
+#: turboctl-gui:302
+msgid "Open Turbo Boost"
+msgstr ""
+
+#: turboctl-gui:309
+msgid "Quit"
+msgstr ""
+
+#: turboctl-gui:359
+msgid "Temperature"
+msgstr ""
+
+#: turboctl-gui:360
+msgid "Power"
+msgstr ""
+
+#: turboctl-gui:361
+msgid "Frequency"
+msgstr ""
+
+#: turboctl-gui:392
+msgid "Turbo"
+msgstr ""
+
+#: turboctl-gui:400
+msgid "1 active core"
+msgstr ""
+
+#: turboctl-gui:400
+#, python-brace-format
+msgid "{} active cores"
+msgstr ""
+
+#: turboctl-gui:407
+msgid "Max power (PL1)"
+msgstr ""
+
+#: turboctl-gui:407
+msgid "Throttle at"
+msgstr ""
+
+#: turboctl-gui:417 turboctl-gui:428
+msgid "Apply"
+msgstr ""
+
+#: turboctl-gui:419
+msgid "Undervolt"
+msgstr ""
+
+#: turboctl-gui:514
+msgid "Changes not applied"
+msgstr ""
+
+#: turboctl-gui:568
+msgid ""
+"This CPU generation is untested: check the readings before relying on it."
+msgstr ""
+
+#: turboctl-gui:576
+msgid "Cores: "
+msgstr ""
+
+#: turboctl-gui:577
+msgid "none"
+msgstr ""
+
+#: turboctl-gui:578
+msgid "Active limit: "
+msgstr ""
+
+#: turboctl-gui:587
+#, python-brace-format
+msgid "Unclean shutdown with {} mV: undervolt reset to 0 mV for safety."
+msgstr ""
+
+#: turboctl-gui:593
+msgid "Active profile: "
+msgstr ""
+
+#: turboctl-gui:598
+msgid "The control service stopped."
+msgstr ""
+
+#: turboctl-gui:600
+msgid ""
+"Authorization refused or CPU not supported. Run “sudo turboctl status” for "
+"details."
+msgstr ""

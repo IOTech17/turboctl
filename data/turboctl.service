@@ -1,0 +1,13 @@
+[Unit]
+Description=Apply the saved turboctl CPU limits
+# Run after tools that may also write turbo settings, so ours win.
+After=power-profiles-daemon.service tlp.service system76-power.service
+After=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+
+[Service]
+Type=oneshot
+ExecStart=@SBINDIR@/turboctl apply
+
+[Install]
+# The CPU forgets its limits on sleep, so they are applied again on resume.
+WantedBy=multi-user.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target

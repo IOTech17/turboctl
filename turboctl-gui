@@ -1,0 +1,641 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""GTK control panel and tray icon for turboctl.
+
+turboctl-gui          open the window (or show it if already running)
+turboctl-gui --tray   start hidden in the tray, used at login
+"""
+import gettext
+import json
+import locale
+import os
+import subprocess
+import sys
+import threading
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gio, GLib, Gtk  # noqa: E402
+
+APP_ID = "io.github.iotech17.turboctl"
+SBINDIR = "@SBINDIR@"  # filled in by install.sh
+LOCALEDIR = "@LOCALEDIR@"
+if SBINDIR.startswith("@"):  # running from the source tree
+    SBINDIR, LOCALEDIR = "/usr/sbin", None
+
+try:
+    locale.setlocale(locale.LC_ALL, "")
+except locale.Error:
+    pass
+_ = gettext.translation("turboctl", LOCALEDIR, fallback=True).gettext
+
+# Without --disable-internal-agent, pkexec started from a terminal asks for the
+# password on the tty and reads it from our stdin pipe, so authentication fails.
+HELPER = ["pkexec", "--disable-internal-agent", SBINDIR + "/turboctl", "serve"]
+TRAY_WAIT_SECONDS = 60  # at login the panel may start after us
+
+PROFILE_LABELS = {"off": _("Turbo off"), "cool": _("Cool"), "stock": _("Stock"), "custom": _("Custom")}
+LIMIT_LABELS = {
+    "MAX_TURBO": _("frequency ceiling"),
+    "PL1": _("power (PL1)"),
+    "PL2": _("power (PL2)"),
+    "THERMAL": _("temperature"),
+    "PROCHOT": "PROCHOT",
+}
+
+
+def number(value):
+    return locale.format_string("%.1f", value)
+
+
+def ghz(ratio):
+    return number(ratio / 10) + " GHz"
+
+
+def watts(value):
+    return number(value) + " W"
+
+
+def big(text, color=None):
+    color_attr = f' foreground="{color}"' if color else ""
+    return f'<span size="x-large" weight="bold"{color_attr}>{GLib.markup_escape_text(text)}</span>'
+
+
+# ---------------------------------------------------------------- tray (StatusNotifierItem over D-Bus)
+
+SNI_XML = """<node><interface name="org.kde.StatusNotifierItem">
+  <property name="Category" type="s" access="read"/>
+  <property name="Id" type="s" access="read"/>
+  <property name="Title" type="s" access="read"/>
+  <property name="Status" type="s" access="read"/>
+  <property name="WindowId" type="i" access="read"/>
+  <property name="IconName" type="s" access="read"/>
+  <property name="IconThemePath" type="s" access="read"/>
+  <property name="IconPixmap" type="a(iiay)" access="read"/>
+  <property name="OverlayIconName" type="s" access="read"/>
+  <property name="AttentionIconName" type="s" access="read"/>
+  <property name="ToolTip" type="(sa(iiay)ss)" access="read"/>
+  <property name="ItemIsMenu" type="b" access="read"/>
+  <property name="Menu" type="o" access="read"/>
+  <method name="Activate"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
+  <method name="SecondaryActivate"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
+  <method name="ContextMenu"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
+  <method name="Scroll"><arg type="i" direction="in"/><arg type="s" direction="in"/></method>
+  <signal name="NewTitle"/>
+  <signal name="NewIcon"/>
+  <signal name="NewToolTip"/>
+  <signal name="NewStatus"><arg type="s"/></signal>
+</interface></node>"""
+
+MENU_XML = """<node><interface name="com.canonical.dbusmenu">
+  <property name="Version" type="u" access="read"/>
+  <property name="TextDirection" type="s" access="read"/>
+  <property name="Status" type="s" access="read"/>
+  <property name="IconThemePath" type="as" access="read"/>
+  <method name="GetLayout">
+    <arg type="i" direction="in"/><arg type="i" direction="in"/><arg type="as" direction="in"/>
+    <arg type="u" direction="out"/><arg type="(ia{sv}av)" direction="out"/>
+  </method>
+  <method name="GetGroupProperties">
+    <arg type="ai" direction="in"/><arg type="as" direction="in"/><arg type="a(ia{sv})" direction="out"/>
+  </method>
+  <method name="GetProperty">
+    <arg type="i" direction="in"/><arg type="s" direction="in"/><arg type="v" direction="out"/>
+  </method>
+  <method name="Event">
+    <arg type="i" direction="in"/><arg type="s" direction="in"/>
+    <arg type="v" direction="in"/><arg type="u" direction="in"/>
+  </method>
+  <method name="EventGroup"><arg type="a(isvu)" direction="in"/><arg type="ai" direction="out"/></method>
+  <method name="AboutToShow"><arg type="i" direction="in"/><arg type="b" direction="out"/></method>
+  <method name="AboutToShowGroup">
+    <arg type="ai" direction="in"/><arg type="ai" direction="out"/><arg type="ai" direction="out"/>
+  </method>
+  <signal name="ItemsPropertiesUpdated"><arg type="a(ia{sv})"/><arg type="a(ias)"/></signal>
+  <signal name="LayoutUpdated"><arg type="u"/><arg type="i"/></signal>
+  <signal name="ItemActivationRequested"><arg type="i"/><arg type="u"/></signal>
+</interface></node>"""
+
+MENU_PROPERTY_TYPES = {
+    "type": "s",
+    "label": "s",
+    "enabled": "b",
+    "visible": "b",
+    "toggle-type": "s",
+    "toggle-state": "i",
+    "children-display": "s",
+}
+
+
+def interface_info(xml):
+    return Gio.DBusNodeInfo.new_for_xml(xml).interfaces[0]
+
+
+def to_variants(props):
+    return {key: GLib.Variant(MENU_PROPERTY_TYPES[key], value) for key, value in props.items()}
+
+
+class DBusMenu:
+    """Flat com.canonical.dbusmenu menu: labels, radio items and separators."""
+
+    PATH = "/MenuBar"
+    INTERFACE = "com.canonical.dbusmenu"
+
+    def __init__(self, connection):
+        self.connection = connection
+        self.items = {}  # id -> [properties, callback]
+        self.revision = 1
+        connection.register_object(self.PATH, interface_info(MENU_XML), self.on_call, self.on_get, None)
+
+    def add(self, props, callback=None):
+        item_id = len(self.items) + 1
+        self.items[item_id] = [dict(props), callback]
+        return item_id
+
+    def update(self, item_id, **props):
+        current = self.items[item_id][0]
+        changed = {key: value for key, value in props.items() if current.get(key) != value}
+        if changed:
+            current.update(changed)
+            self.connection.emit_signal(
+                None,
+                self.PATH,
+                self.INTERFACE,
+                "ItemsPropertiesUpdated",
+                GLib.Variant("(a(ia{sv})a(ias))", ([(item_id, to_variants(changed))], [])),
+            )
+
+    def node(self, item_id):
+        return GLib.Variant("(ia{sv}av)", (item_id, to_variants(self.items[item_id][0]), []))
+
+    def layout(self, parent):
+        if parent in self.items:
+            return (parent, to_variants(self.items[parent][0]), [])
+        children = [self.node(item_id) for item_id in self.items]
+        return (0, to_variants({"children-display": "submenu"}), children)
+
+    def activate(self, item_id, event):
+        callback = self.items.get(item_id, [None, None])[1]
+        if event == "clicked" and callback:
+            GLib.idle_add(lambda: (callback(), GLib.SOURCE_REMOVE)[1])
+
+    def on_get(self, _conn, _sender, _path, _iface, name):
+        values = {
+            "Version": GLib.Variant("u", 3),
+            "TextDirection": GLib.Variant("s", "ltr"),
+            "Status": GLib.Variant("s", "normal"),
+            "IconThemePath": GLib.Variant("as", []),
+        }
+        return values.get(name)
+
+    def on_call(self, _conn, _sender, _path, _iface, method, params, invocation):
+        args = params.unpack()
+        if method == "GetLayout":
+            invocation.return_value(GLib.Variant("(u(ia{sv}av))", (self.revision, self.layout(args[0]))))
+        elif method == "GetGroupProperties":
+            found = [(i, to_variants(self.items[i][0])) for i in args[0] if i in self.items]
+            invocation.return_value(GLib.Variant("(a(ia{sv}))", (found,)))
+        elif method == "GetProperty":
+            props = self.items.get(args[0], [{}])[0]
+            if args[1] not in props:
+                invocation.return_dbus_error(self.INTERFACE + ".Error", "unknown property")
+                return
+            invocation.return_value(GLib.Variant("(v)", (to_variants({args[1]: props[args[1]]})[args[1]],)))
+        elif method == "Event":
+            self.activate(args[0], args[1])
+            invocation.return_value(None)
+        elif method == "EventGroup":
+            for item_id, event, _data, _time in args[0]:
+                self.activate(item_id, event)
+            invocation.return_value(GLib.Variant("(ai)", ([],)))
+        elif method == "AboutToShow":
+            invocation.return_value(GLib.Variant("(b)", (False,)))
+        elif method == "AboutToShowGroup":
+            invocation.return_value(GLib.Variant("(aiai)", ([], [])))
+
+
+class StatusNotifierItem:
+    """Tray icon: left click calls on_activate, right click shows the menu."""
+
+    PATH = "/StatusNotifierItem"
+    INTERFACE = "org.kde.StatusNotifierItem"
+    WATCHER = "org.kde.StatusNotifierWatcher"
+
+    def __init__(self, title, on_activate):
+        self.title = title
+        self.tooltip = ""
+        self.on_activate = on_activate
+        self.registered = False
+        self.connection = Gio.bus_get_sync(Gio.BusType.SESSION)
+        self.connection.register_object(self.PATH, interface_info(SNI_XML), self.on_call, self.on_get, None)
+        self.menu = DBusMenu(self.connection)
+        self.bus_name = f"org.kde.StatusNotifierItem-{os.getpid()}-1"
+        Gio.bus_own_name_on_connection(
+            self.connection, self.bus_name, Gio.BusNameOwnerFlags.NONE, self.on_name_acquired, None
+        )
+
+    def on_name_acquired(self, connection, _name):
+        # Registering again whenever the watcher appears survives panel restarts.
+        Gio.bus_watch_name_on_connection(
+            connection, self.WATCHER, Gio.BusNameWatcherFlags.NONE, self.on_watcher_appeared, self.on_watcher_vanished
+        )
+
+    def on_watcher_appeared(self, connection, _name, _owner):
+        connection.call(
+            self.WATCHER,
+            "/StatusNotifierWatcher",
+            self.WATCHER,
+            "RegisterStatusNotifierItem",
+            GLib.Variant("(s)", (self.bus_name,)),
+            None,
+            Gio.DBusCallFlags.NONE,
+            -1,
+            None,
+            self.on_register_reply,
+        )
+
+    def on_register_reply(self, connection, result):
+        try:
+            connection.call_finish(result)
+            self.registered = True
+        except GLib.Error:
+            self.registered = False
+
+    def on_watcher_vanished(self, _connection, _name):
+        self.registered = False
+
+    def set_tooltip(self, text):
+        if text != self.tooltip:
+            self.tooltip = text
+            self.connection.emit_signal(None, self.PATH, self.INTERFACE, "NewToolTip", None)
+
+    def on_get(self, _conn, _sender, _path, _iface, name):
+        values = {
+            "Category": GLib.Variant("s", "Hardware"),
+            "Id": GLib.Variant("s", "turboctl"),
+            "Title": GLib.Variant("s", self.title),
+            "Status": GLib.Variant("s", "Active"),
+            "WindowId": GLib.Variant("i", 0),
+            "IconName": GLib.Variant("s", "turboctl"),
+            "IconThemePath": GLib.Variant("s", ""),
+            "IconPixmap": GLib.Variant("a(iiay)", []),
+            "OverlayIconName": GLib.Variant("s", ""),
+            "AttentionIconName": GLib.Variant("s", ""),
+            "ToolTip": GLib.Variant("(sa(iiay)ss)", ("turboctl", [], self.title, self.tooltip)),
+            "ItemIsMenu": GLib.Variant("b", False),
+            "Menu": GLib.Variant("o", DBusMenu.PATH),
+        }
+        return values.get(name)
+
+    def on_call(self, _conn, _sender, _path, _iface, method, _params, invocation):
+        if method in ("Activate", "SecondaryActivate"):
+            GLib.idle_add(lambda: (self.on_activate(), GLib.SOURCE_REMOVE)[1])
+        invocation.return_value(None)
+
+
+class Tray:
+    def __init__(self, panel):
+        self.sni = StatusNotifierItem(_("Turbo Boost"), panel.present_window)
+        menu = self.menu = self.sni.menu
+        self.reading_item = menu.add({"label": _("Connecting…"), "enabled": False})
+        menu.add({"type": "separator"})
+        menu.add({"label": _("Open Turbo Boost")}, panel.present_window)
+        menu.add({"type": "separator"})
+        self.profile_items = {
+            name: menu.add({"label": label, "toggle-type": "radio", "toggle-state": 0}, self.chooser(panel, name))
+            for name, label in PROFILE_LABELS.items()
+        }
+        menu.add({"type": "separator"})
+        menu.add({"label": _("Quit")}, panel.quit)
+
+    @staticmethod
+    def chooser(panel, name):
+        return lambda: panel.choose_profile(name)
+
+    @property
+    def available(self):
+        return self.sni.registered
+
+    def update(self, state):
+        reading = f"{state['temp']} °C · {watts(state['watts'])} · {ghz(max(state['freqs']))}"
+        self.menu.update(self.reading_item, label=reading)
+        self.sni.set_tooltip(reading)
+        for name, item in self.profile_items.items():
+            props = {"toggle-state": int(state["profile"] == name), "enabled": name in state["profiles"]}
+            self.menu.update(item, **props)
+
+
+# ---------------------------------------------------------------- window
+
+
+class Panel(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title=_("Turbo Boost"))
+        self.app = app
+        self.set_icon_name("turboctl")
+        self.set_default_size(520, -1)
+        self.set_border_width(16)
+        self.connect("delete-event", self.on_delete)
+        self.loading = False
+        self.dirty = False
+        self.uv_dirty = False
+        self.received_state = False
+        self.controls_built = False
+
+        self.box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self.add(self.box)
+        self.cpu_label = Gtk.Label(xalign=0, wrap=True)
+        self.box.add(self.cpu_label)
+        self.build_readings()
+        self.box.add(Gtk.Separator())
+        self.tray = Tray(self)
+
+        self.helper = subprocess.Popen(
+            HELPER, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1
+        )
+        threading.Thread(target=self.read_helper, daemon=True).start()
+
+    def build_readings(self):
+        grid = Gtk.Grid(column_spacing=12, column_homogeneous=True)
+        self.temp_value = self.add_reading(grid, 0, _("Temperature"))
+        self.watts_value = self.add_reading(grid, 1, _("Power"))
+        self.freq_value = self.add_reading(grid, 2, _("Frequency"))
+        self.box.add(grid)
+        self.cores_label = Gtk.Label(xalign=0, wrap=True)
+        self.limits_label = Gtk.Label(xalign=0)
+        self.box.add(self.cores_label)
+        self.box.add(self.limits_label)
+
+    @staticmethod
+    def add_reading(grid, column, caption):
+        value = Gtk.Label(label="–")
+        grid.attach(value, column, 0, 1, 1)
+        grid.attach(Gtk.Label(label=caption), column, 1, 1, 1)
+        return value
+
+    def build_controls(self, state):
+        """Build the profile and limit controls once the CPU is known."""
+        row = Gtk.Box(spacing=12)
+        self.radios = {}
+        group = None
+        for name, label in PROFILE_LABELS.items():
+            radio = Gtk.RadioButton.new_with_label_from_widget(group, label)
+            group = group or radio
+            radio.connect("toggled", self.on_profile_toggled, name)
+            self.radios[name] = radio
+            row.add(radio)
+        self.box.add(row)
+
+        bounds = state["bounds"]
+        grid = Gtk.Grid(column_spacing=12, row_spacing=6)
+        self.turbo_switch = Gtk.Switch(halign=Gtk.Align.START)
+        self.turbo_switch.connect("notify::active", self.on_turbo_switched)
+        grid.attach(Gtk.Label(label=_("Turbo"), xalign=0), 0, 0, 1, 1)
+        grid.attach(self.turbo_switch, 1, 0, 1, 1)
+
+        self.ratio_scales = []
+        for index in range(state["cpu"]["cores"]):
+            scale = self.make_scale(*bounds["ratio"], ghz)
+            scale.connect("value-changed", self.on_ratio_changed, index)
+            self.ratio_scales.append(scale)
+            caption = _("1 active core") if index == 0 else _("{} active cores").format(index + 1)
+            grid.attach(Gtk.Label(label=caption, xalign=0), 0, index + 1, 1, 1)
+            grid.attach(scale, 1, index + 1, 1, 1)
+
+        row = state["cpu"]["cores"] + 1
+        self.pl1_scale = self.make_scale(*bounds["pl1"], lambda v: f"{v:.0f} W")
+        self.tcc_scale = self.make_scale(*bounds["tcc"], lambda v: f"{v:.0f} °C")
+        for caption, scale in ((_("Max power (PL1)"), self.pl1_scale), (_("Throttle at"), self.tcc_scale)):
+            scale.connect("value-changed", self.on_setting_changed)
+            grid.attach(Gtk.Label(label=caption, xalign=0), 0, row, 1, 1)
+            grid.attach(scale, 1, row, 1, 1)
+            row += 1
+
+        # Independent of the profiles: applied on its own, then with every profile.
+        self.uv_scale = self.make_scale(*bounds["undervolt"], lambda v: f"{v:.0f} mV")
+        self.uv_scale.get_adjustment().set_step_increment(5)
+        self.uv_scale.connect("value-changed", self.on_uv_changed)
+        self.uv_button = Gtk.Button(label=_("Apply"), sensitive=False)
+        self.uv_button.connect("clicked", lambda _button: self.send_undervolt())
+        grid.attach(Gtk.Label(label=_("Undervolt"), xalign=0), 0, row, 1, 1)
+        grid.attach(self.uv_scale, 1, row, 1, 1)
+        grid.attach(self.uv_button, 2, row, 1, 1)
+        self.uv_note = Gtk.Label(xalign=0, wrap=True, max_width_chars=50)
+        grid.attach(self.uv_note, 0, row + 1, 3, 1)
+        self.box.add(grid)
+
+        footer = Gtk.Box(spacing=12)
+        self.status_label = Gtk.Label(xalign=0, wrap=True, max_width_chars=40)
+        self.apply_button = Gtk.Button(label=_("Apply"))
+        self.apply_button.get_style_context().add_class("suggested-action")
+        self.apply_button.connect("clicked", lambda _button: self.send_custom())
+        footer.pack_start(self.status_label, True, True, 0)
+        footer.pack_end(self.apply_button, False, False, 0)
+        self.box.add(footer)
+
+        writable = state["writable"]
+        self.ratios_writable = writable["ratios"]
+        self.tcc_scale.set_sensitive(writable["tcc"])
+        self.pl1_scale.set_sensitive(state["pl1"] is not None)
+        self.controls_built = True
+        self.box.show_all()
+
+    @staticmethod
+    def make_scale(low, high, formatter):
+        scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, low, high, 1)
+        scale.set_hexpand(True)
+        scale.set_digits(0)
+        scale.set_value_pos(Gtk.PositionType.RIGHT)
+        scale.connect("format-value", lambda _scale, value: formatter(value))
+        return scale
+
+    def present_window(self):
+        self.show_all()
+        self.present()
+
+    def on_delete(self, _window, _event):
+        if self.tray.available:
+            self.hide()
+            return True
+        self.quit()
+        return False
+
+    def quit(self):
+        # Closing stdin makes the root helper exit.
+        try:
+            self.helper.stdin.close()
+        except BrokenPipeError:
+            pass
+        self.app.quit()
+
+    def read_helper(self):
+        for line in self.helper.stdout:
+            GLib.idle_add(self.on_state, json.loads(line))
+        GLib.idle_add(self.on_helper_exit)
+
+    def send(self, request):
+        try:
+            self.helper.stdin.write(json.dumps(request) + "\n")
+            self.helper.stdin.flush()
+        except (BrokenPipeError, ValueError):
+            pass
+
+    def choose_profile(self, name):
+        self.dirty = False
+        self.send({"profile": name})
+
+    def send_custom(self):
+        self.dirty = False
+        self.send(
+            {
+                "custom": {
+                    "turbo": self.turbo_switch.get_active(),
+                    "ratios": [int(scale.get_value()) for scale in self.ratio_scales],
+                    "pl1": int(self.pl1_scale.get_value()),
+                    "tcc": int(self.tcc_scale.get_value()),
+                }
+            }
+        )
+
+    def send_undervolt(self):
+        self.uv_dirty = False
+        self.uv_button.set_sensitive(False)
+        self.send({"undervolt": round(self.uv_scale.get_value())})
+
+    def on_uv_changed(self, _scale):
+        if not self.loading:
+            self.uv_dirty = True
+            self.uv_button.set_sensitive(True)
+
+    def mark_modified(self):
+        self.dirty = True
+        self.loading = True
+        self.radios["custom"].set_active(True)
+        self.loading = False
+        self.status_label.set_text(_("Changes not applied"))
+
+    def on_profile_toggled(self, radio, name):
+        if self.loading or not radio.get_active():
+            return
+        if name == "custom":
+            self.send_custom()
+        else:
+            self.choose_profile(name)
+
+    def on_turbo_switched(self, _switch, _param):
+        self.update_sensitivity()
+        if not self.loading:
+            self.mark_modified()
+
+    def on_setting_changed(self, _scale):
+        if not self.loading:
+            self.mark_modified()
+
+    def on_ratio_changed(self, scale, index):
+        if self.loading:
+            return
+        value = scale.get_value()
+        self.loading = True
+        # The CPU expects the ceiling to never rise with more active cores.
+        for other, neighbour in enumerate(self.ratio_scales):
+            if (other < index and neighbour.get_value() < value) or (other > index and neighbour.get_value() > value):
+                neighbour.set_value(value)
+        self.loading = False
+        self.mark_modified()
+
+    def update_sensitivity(self):
+        for scale in self.ratio_scales:
+            scale.set_sensitive(self.ratios_writable and self.turbo_switch.get_active())
+
+    def load_controls(self, state):
+        self.loading = True
+        self.radios[state["profile"]].set_active(True)
+        self.turbo_switch.set_active(state["turbo"])
+        for scale, ratio in zip(self.ratio_scales, state["ratios"]):
+            scale.set_value(ratio)
+        if state["pl1"] is not None:
+            self.pl1_scale.set_value(state["pl1"])
+        self.tcc_scale.set_value(state["tcc"])
+        self.loading = False
+        self.update_sensitivity()
+
+    def on_state(self, state):
+        self.received_state = True
+        if not self.controls_built:
+            self.build_controls(state)
+            cpu = state["cpu"]
+            text = f"{cpu['name']} · {cpu['generation']}"
+            if not cpu["tested"]:
+                text += "\n" + _("This CPU generation is untested: check the readings before relying on it.")
+            self.cpu_label.set_text(text)
+
+        temp = state["temp"]
+        color = "#d0342c" if temp >= 90 else "#e08a00" if temp >= 85 else None
+        self.temp_value.set_markup(big(f"{temp} °C", color))
+        self.watts_value.set_markup(big(watts(state["watts"])))
+        self.freq_value.set_markup(big(ghz(max(state["freqs"]))))
+        self.cores_label.set_text(_("Cores: ") + " / ".join(ghz(freq) for freq in state["freqs"]))
+        limits = ", ".join(LIMIT_LABELS.get(name, name) for name in state["limits"]) or _("none")
+        self.limits_label.set_text(_("Active limit: ") + limits)
+        self.tray.update(state)
+
+        if not self.uv_dirty:
+            self.loading = True
+            self.uv_scale.set_value(state["undervolt"])
+            self.loading = False
+        crash = state["undervolt_crash"]
+        self.uv_note.set_text(
+            _("Unclean shutdown with {} mV: undervolt reset to 0 mV for safety.").format(crash) if crash else ""
+        )
+
+        if not self.dirty:
+            self.load_controls(state)
+            label = PROFILE_LABELS[state["profile"]]
+            self.status_label.set_text(state["error"] or _("Active profile: ") + label)
+        return GLib.SOURCE_REMOVE
+
+    def on_helper_exit(self):
+        if self.received_state:
+            message = _("The control service stopped.")
+        else:
+            message = _("Authorization refused or CPU not supported. Run “sudo turboctl status” for details.")
+        dialog = Gtk.MessageDialog(
+            transient_for=self, message_type=Gtk.MessageType.ERROR, buttons=Gtk.ButtonsType.CLOSE, text=message
+        )
+        dialog.run()
+        self.app.quit()
+        return GLib.SOURCE_REMOVE
+
+
+class App(Gtk.Application):
+    """Single instance: launching again from the menu shows the running window."""
+
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
+        self.panel = None
+
+    def do_command_line(self, command_line):
+        tray_only = "--tray" in command_line.get_arguments()[1:]
+        if self.panel is None:
+            self.panel = Panel(self)
+            self.hold()  # keep running while the window is hidden
+            if tray_only:
+                GLib.timeout_add_seconds(TRAY_WAIT_SECONDS, self.quit_without_tray)
+        if not tray_only:
+            self.panel.present_window()
+        return 0
+
+    def quit_without_tray(self):
+        # No tray host showed up (e.g. GNOME without the AppIndicator extension).
+        if not self.panel.tray.available and not self.panel.get_visible():
+            self.panel.quit()
+        return GLib.SOURCE_REMOVE
+
+
+def main():
+    sys.exit(App().run(sys.argv))
+
+
+if __name__ == "__main__":
+    main()

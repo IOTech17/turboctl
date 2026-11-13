@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Turbo Boost
+Comment=Control CPU turbo, power limits and undervolt
+Comment[fr]=Contrôler le turbo, les limites de puissance et le sous-voltage du CPU
+Exec=@BINDIR@/turboctl-gui
+Icon=turboctl
+Categories=Settings;HardwareSettings;
+Keywords=cpu;turbo;boost;undervolt;temperature;power;
+Keywords[fr]=cpu;turbo;boost;sous-voltage;température;puissance;
+Terminal=false
+StartupNotify=true

@@ -1,0 +1,12 @@
+[Unit]
+Description=Record a clean shutdown for the turboctl undervolt guard
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+# Only a clean shutdown removes the marker; after a freeze, the next boot skips the undervolt.
+ExecStop=@SBINDIR@/turboctl clean-shutdown
+
+[Install]
+WantedBy=multi-user.target

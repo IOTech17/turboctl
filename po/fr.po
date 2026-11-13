@@ -1,0 +1,109 @@
+# French translation of turboctl.
+# SPDX-License-Identifier: GPL-3.0-or-later
+msgid ""
+msgstr ""
+"Project-Id-Version: turboctl\n"
+"Language: fr\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=2; plural=(n > 1);\n"
+
+msgid "Turbo off"
+msgstr "Turbo coupé"
+
+msgid "Cool"
+msgstr "Frais"
+
+msgid "Stock"
+msgstr "Origine"
+
+msgid "Custom"
+msgstr "Personnalisé"
+
+msgid "frequency ceiling"
+msgstr "plafond de fréquence"
+
+msgid "power (PL1)"
+msgstr "puissance (PL1)"
+
+msgid "power (PL2)"
+msgstr "puissance (PL2)"
+
+msgid "temperature"
+msgstr "température"
+
+msgid "Turbo Boost"
+msgstr "Turbo Boost"
+
+msgid "Connecting…"
+msgstr "Connexion…"
+
+msgid "Open Turbo Boost"
+msgstr "Ouvrir Turbo Boost"
+
+msgid "Quit"
+msgstr "Quitter"
+
+msgid "Temperature"
+msgstr "Température"
+
+msgid "Power"
+msgstr "Puissance"
+
+msgid "Frequency"
+msgstr "Fréquence"
+
+msgid "Turbo"
+msgstr "Turbo"
+
+msgid "1 active core"
+msgstr "1 cœur actif"
+
+msgid "{} active cores"
+msgstr "{} cœurs actifs"
+
+msgid "Max power (PL1)"
+msgstr "Puissance max (PL1)"
+
+msgid "Throttle at"
+msgstr "Bridage thermique"
+
+msgid "Apply"
+msgstr "Appliquer"
+
+msgid "Undervolt"
+msgstr "Sous-voltage"
+
+msgid "Changes not applied"
+msgstr "Modifications non appliquées"
+
+msgid ""
+"This CPU generation is untested: check the readings before relying on it."
+msgstr ""
+"Génération de CPU non testée : vérifiez les mesures avant de vous y fier."
+
+msgid "Cores: "
+msgstr "Cœurs : "
+
+msgid "none"
+msgstr "aucune"
+
+msgid "Active limit: "
+msgstr "Limite active : "
+
+msgid "Unclean shutdown with {} mV: undervolt reset to 0 mV for safety."
+msgstr "Arrêt anormal avec {} mV : sous-voltage remis à 0 mV par sécurité."
+
+msgid "Active profile: "
+msgstr "Profil actif : "
+
+msgid "The control service stopped."
+msgstr "Le service de contrôle s'est arrêté."
+
+msgid ""
+"Authorization refused or CPU not supported. Run “sudo turboctl status” for "
+"details."
+msgstr ""
+"Autorisation refusée ou CPU non pris en charge. Lancez « sudo turboctl "
+"status » pour en savoir plus."

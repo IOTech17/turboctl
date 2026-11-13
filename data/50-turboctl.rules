@@ -1,0 +1,11 @@
+// Lets administrators of a local, active session run turboctl without a password,
+// so the tray icon can start at login. Only turboctl is allowed, and turboctl only
+// accepts values within the limits read from the CPU.
+// Delete this file (or install with NOPASSWD=0) to be asked for a password instead.
+polkit.addRule(function (action, subject) {
+    if (action.id == "io.github.iotech17.turboctl" &&
+        subject.local && subject.active &&
+        (subject.isInGroup("wheel") || subject.isInGroup("sudo") || subject.isInGroup("admin"))) {
+        return polkit.Result.YES;
+    }
+});

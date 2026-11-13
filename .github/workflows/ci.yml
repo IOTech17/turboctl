@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-gi gir1.2-gtk-3.0 gettext shellcheck desktop-file-utils
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Lint
+        run: |
+          pipx run ruff check .
+          shellcheck install.sh uninstall.sh
+          desktop-file-validate data/*.desktop
+          msgfmt --check -o /dev/null po/fr.po
+      - name: Staged install
+        run: |
+          DESTDIR="$PWD/stage" ./install.sh --files-only
+          find stage -type f | sort
+          ! grep -r "@[A-Z]*DIR@" stage
+          python3 -m py_compile stage/usr/sbin/turboctl stage/usr/bin/turboctl-gui
