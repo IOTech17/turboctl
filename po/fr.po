@@ -107,3 +107,9 @@ msgid ""
 msgstr ""
 "Autorisation refusée ou CPU non pris en charge. Lancez « sudo turboctl "
 "status » pour en savoir plus."
+
+msgid "System default"
+msgstr "Langue du système"
+
+msgid "Language"
+msgstr "Langue"

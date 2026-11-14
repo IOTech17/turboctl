@@ -8,7 +8,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: turboctl\n"
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2026-11-13 09:18+0000\n"
+"POT-Creation-Date: 2026-11-14 08:25+0000\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language-Team: LANGUAGE <LL@li.org>\n"
@@ -17,130 +17,138 @@ msgstr ""
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 
-#: turboctl-gui:38
+#: turboctl-gui:60
 msgid "Turbo off"
 msgstr ""
 
-#: turboctl-gui:38
+#: turboctl-gui:60
 msgid "Cool"
 msgstr ""
 
-#: turboctl-gui:38
+#: turboctl-gui:60
 msgid "Stock"
 msgstr ""
 
-#: turboctl-gui:38
+#: turboctl-gui:60
 msgid "Custom"
 msgstr ""
 
-#: turboctl-gui:40
+#: turboctl-gui:62
 msgid "frequency ceiling"
 msgstr ""
 
-#: turboctl-gui:41
+#: turboctl-gui:63
 msgid "power (PL1)"
 msgstr ""
 
-#: turboctl-gui:42
+#: turboctl-gui:64
 msgid "power (PL2)"
 msgstr ""
 
-#: turboctl-gui:43
+#: turboctl-gui:65
 msgid "temperature"
 msgstr ""
 
-#: turboctl-gui:298 turboctl-gui:332
+#: turboctl-gui:321 turboctl-gui:356
 msgid "Turbo Boost"
 msgstr ""
 
-#: turboctl-gui:300
+#: turboctl-gui:323
 msgid "Connecting…"
 msgstr ""
 
-#: turboctl-gui:302
+#: turboctl-gui:325
 msgid "Open Turbo Boost"
 msgstr ""
 
-#: turboctl-gui:309
+#: turboctl-gui:332
 msgid "Quit"
 msgstr ""
 
-#: turboctl-gui:359
+#: turboctl-gui:384
 msgid "Temperature"
 msgstr ""
 
-#: turboctl-gui:360
+#: turboctl-gui:385
 msgid "Power"
 msgstr ""
 
-#: turboctl-gui:361
+#: turboctl-gui:386
 msgid "Frequency"
 msgstr ""
 
-#: turboctl-gui:392
+#: turboctl-gui:395
+msgid "System default"
+msgstr ""
+
+#: turboctl-gui:402
+msgid "Language"
+msgstr ""
+
+#: turboctl-gui:435
 msgid "Turbo"
 msgstr ""
 
-#: turboctl-gui:400
+#: turboctl-gui:443
 msgid "1 active core"
 msgstr ""
 
-#: turboctl-gui:400
+#: turboctl-gui:443
 #, python-brace-format
 msgid "{} active cores"
 msgstr ""
 
-#: turboctl-gui:407
+#: turboctl-gui:450
 msgid "Max power (PL1)"
 msgstr ""
 
-#: turboctl-gui:407
+#: turboctl-gui:450
 msgid "Throttle at"
 msgstr ""
 
-#: turboctl-gui:417 turboctl-gui:428
+#: turboctl-gui:460 turboctl-gui:471
 msgid "Apply"
 msgstr ""
 
-#: turboctl-gui:419
+#: turboctl-gui:462
 msgid "Undervolt"
 msgstr ""
 
-#: turboctl-gui:514
+#: turboctl-gui:557
 msgid "Changes not applied"
 msgstr ""
 
-#: turboctl-gui:568
+#: turboctl-gui:611
 msgid ""
 "This CPU generation is untested: check the readings before relying on it."
 msgstr ""
 
-#: turboctl-gui:576
+#: turboctl-gui:619
 msgid "Cores: "
 msgstr ""
 
-#: turboctl-gui:577
+#: turboctl-gui:620
 msgid "none"
 msgstr ""
 
-#: turboctl-gui:578
+#: turboctl-gui:621
 msgid "Active limit: "
 msgstr ""
 
-#: turboctl-gui:587
+#: turboctl-gui:630
 #, python-brace-format
 msgid "Unclean shutdown with {} mV: undervolt reset to 0 mV for safety."
 msgstr ""
 
-#: turboctl-gui:593
+#: turboctl-gui:636
 msgid "Active profile: "
 msgstr ""
 
-#: turboctl-gui:598
+#: turboctl-gui:641
 msgid "The control service stopped."
 msgstr ""
 
-#: turboctl-gui:600
+#: turboctl-gui:643
 msgid ""
 "Authorization refused or CPU not supported. Run “sudo turboctl status” for "
 "details."

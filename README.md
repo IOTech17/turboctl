@@ -64,6 +64,11 @@ works on its own.
 
 Left click opens the window, right click opens the menu (live readings and profiles).
 
+### Language
+
+The window follows the system language (English or French). To choose another one, use the
+*Language* menu at the bottom of the window; the window restarts in that language.
+
 ### Password
 
 `install.sh` installs a polkit rule so that administrators (groups `wheel`, `sudo` or

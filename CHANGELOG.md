@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Language selector in the window (system default, English, Français), saved in
+  `~/.config/turboctl/gui.json`
+
 ## 1.0.0
 
 First public release.

@@ -24,6 +24,28 @@ LOCALEDIR = "@LOCALEDIR@"
 if SBINDIR.startswith("@"):  # running from the source tree
     SBINDIR, LOCALEDIR = "/usr/sbin", None
 
+CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "turboctl", "gui.json")
+LANGUAGES = {"en": "English", "fr": "Français"}  # each shown in its own language
+
+
+def saved_language():
+    """The language chosen in the window, or "" to follow the system."""
+    try:
+        with open(CONFIG, encoding="utf-8") as file:
+            language = json.load(file).get("language", "")
+    except (OSError, ValueError, AttributeError):
+        return ""
+    return language if language in LANGUAGES else ""
+
+
+def save_language(language):
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    with open(CONFIG, "w", encoding="utf-8") as file:
+        json.dump({"language": language}, file)
+
+
+if saved_language():
+    os.environ["LANGUAGE"] = saved_language()  # read by gettext, here and in GTK
 try:
     locale.setlocale(locale.LC_ALL, "")
 except locale.Error:
@@ -349,6 +371,7 @@ class Panel(Gtk.ApplicationWindow):
         self.box.add(self.cpu_label)
         self.build_readings()
         self.box.add(Gtk.Separator())
+        self.box.pack_end(self.build_language_row(), False, False, 0)
         self.tray = Tray(self)
 
         self.helper = subprocess.Popen(
@@ -366,6 +389,24 @@ class Panel(Gtk.ApplicationWindow):
         self.limits_label = Gtk.Label(xalign=0)
         self.box.add(self.cores_label)
         self.box.add(self.limits_label)
+
+    def build_language_row(self):
+        combo = Gtk.ComboBoxText()
+        combo.append("", _("System default"))
+        for code, name in LANGUAGES.items():
+            combo.append(code, name)
+        combo.set_active_id(saved_language())
+        combo.connect("changed", self.on_language_changed)
+        row = Gtk.Box(spacing=6)
+        row.pack_end(combo, False, False, 0)
+        row.pack_end(Gtk.Label(label=_("Language")), False, False, 0)
+        return row
+
+    def on_language_changed(self, combo):
+        # The labels are built once, so the window restarts in the new language.
+        save_language(combo.get_active_id())
+        self.app.restart = True
+        self.quit()
 
     @staticmethod
     def add_reading(grid, column, caption):
@@ -614,6 +655,7 @@ class App(Gtk.Application):
     def __init__(self):
         super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
         self.panel = None
+        self.restart = False
 
     def do_command_line(self, command_line):
         tray_only = "--tray" in command_line.get_arguments()[1:]
@@ -634,7 +676,14 @@ class App(Gtk.Application):
 
 
 def main():
-    sys.exit(App().run(sys.argv))
+    app = App()
+    status = app.run(sys.argv)
+    if app.restart:
+        # Release the application and tray names before the new process asks for them.
+        app.get_dbus_connection().close_sync(None)
+        script = os.path.abspath(sys.argv[0])
+        os.execv(sys.executable, [sys.executable, script])  # without --tray: show the window
+    sys.exit(status)
 
 
 if __name__ == "__main__":

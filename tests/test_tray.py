@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Tests for the D-Bus menu of the tray icon, without a session bus."""
+import os
+import tempfile
 import unittest
+from unittest import mock
 
 from test_turboctl import load
 
@@ -42,6 +45,30 @@ class DBusMenu(unittest.TestCase):
         self.menu.update(self.radio, **{"toggle-state": 1})
         expected = [("ItemsPropertiesUpdated", ([(self.radio, {"toggle-state": 1})], []))]
         self.assertEqual(self.connection.signals, expected)
+
+
+@unittest.skipIf(gui is None, "PyGObject with GTK 3 is not installed")
+class Language(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        patcher = mock.patch.object(gui, "CONFIG", os.path.join(self.directory.name, "turboctl", "gui.json"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_round_trip(self):
+        self.assertEqual(gui.saved_language(), "")
+        gui.save_language("fr")
+        self.assertEqual(gui.saved_language(), "fr")
+        gui.save_language("")
+        self.assertEqual(gui.saved_language(), "")
+
+    def test_unknown_or_broken_file_follows_system(self):
+        os.makedirs(os.path.dirname(gui.CONFIG))
+        for content in ('{"language": "xx"}', "[1]", "not json"):
+            with open(gui.CONFIG, "w") as file:
+                file.write(content)
+            self.assertEqual(gui.saved_language(), "")
 
 
 if __name__ == "__main__":
