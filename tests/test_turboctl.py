@@ -2,7 +2,12 @@
 """Tests for the hardware-independent logic of turboctl (no root, no MSR access)."""
 import importlib.machinery
 import importlib.util
+import io
+import json
 import os
+import shutil
+import subprocess
+import tarfile
 import tempfile
 import unittest
 from unittest import mock
@@ -90,6 +95,71 @@ class Profiles(unittest.TestCase):
                 self.assertFalse(turboctl.valid_profile(profile, I7_5700HQ, FACTORY))
 
 
+# A Ryzen 7 H 255 as detect_amd() reports it, with SMU access, and its factory limits.
+RYZEN_H255 = {
+    "vendor": "amd",
+    "name": "AMD Ryzen 7 H 255 w/ Radeon 780M Graphics",
+    "generation": "Hawk Point",
+    "tested": True,
+    "cores": 8,
+    "max_freq": 4900,
+    "min_freq": 1500,
+    "smu": object(),
+    "smu_note": None,
+    "tctl": True,
+}
+AMD_FACTORY = {"max_freq": 4900, "power": 45.0, "slow": 54.0, "fast": 65.0, "temp": 100.0}
+
+
+class AmdProfiles(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.object(turboctl, "CUSTOM_FILE", "/nonexistent/custom.json")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_profiles(self):
+        profiles = turboctl.build_profiles(RYZEN_H255, AMD_FACTORY)
+        self.assertEqual(profiles["stock"], {"max_freq": 4900, "power": 54, "temp": 100, "turbo": True})
+        self.assertEqual(profiles["cool"], {"max_freq": 4900, "power": 35, "temp": 85, "turbo": True})
+        self.assertFalse(profiles["off"]["turbo"])
+        for name, profile in profiles.items():
+            with self.subTest(name):
+                self.assertTrue(turboctl.valid_profile(profile, RYZEN_H255, AMD_FACTORY))
+
+    def test_bounds(self):
+        self.assertEqual(
+            turboctl.bounds(RYZEN_H255, AMD_FACTORY),
+            {"max_freq": [1500, 4900], "power": [16, 54], "temp": [60, 100]},
+        )
+
+    def test_without_smu_only_frequency(self):
+        cpu = dict(RYZEN_H255, smu=None, tctl=False, smu_note="smu_unsupported")
+        factory = {"max_freq": 4900}
+        profiles = turboctl.build_profiles(cpu, factory)
+        self.assertEqual(profiles["cool"], {"max_freq": 4900, "turbo": True})
+        self.assertEqual(turboctl.fields(cpu), ["max_freq"])
+        self.assertTrue(turboctl.valid_profile(profiles["cool"], cpu, factory))
+        self.assertFalse(turboctl.valid_profile(dict(profiles["cool"], power=30), cpu, factory))
+
+    def test_invalid_profiles(self):
+        good = {"turbo": True, "max_freq": 4000, "power": 30, "temp": 85}
+        bad = {
+            "frequency not a 100 MHz step": dict(good, max_freq=4050),
+            "frequency above the hardware": dict(good, max_freq=5000),
+            "power too low": dict(good, power=15),
+            "power too high": dict(good, power=55),
+            "temperature too low": dict(good, temp=59),
+            "temperature above factory": dict(good, temp=101),
+            "missing field": {"turbo": True, "max_freq": 4000, "power": 30},
+            "Intel field": dict(good, pl1=30),
+            "power as float": dict(good, power=30.0),
+        }
+        self.assertTrue(turboctl.valid_profile(good, RYZEN_H255, AMD_FACTORY))
+        for name, profile in bad.items():
+            with self.subTest(name):
+                self.assertFalse(turboctl.valid_profile(profile, RYZEN_H255, AMD_FACTORY))
+
+
 class Undervolt(unittest.TestCase):
     def test_offset_encoding(self):
         self.assertEqual(turboctl.offset_units(0), 0)
@@ -146,6 +216,89 @@ class KernelErrors(unittest.TestCase):
             self.assertTrue(turboctl.KERNEL_ERROR.search(line), line)
         for line in normal:
             self.assertFalse(turboctl.KERNEL_ERROR.search(line), line)
+
+
+@unittest.skipUnless(shutil.which("ssh-keygen"), "needs ssh-keygen")
+@unittest.skipIf(os.environ.get("TURBOCTL_UPDATING"), "run by turboctl update on the new release")
+class Update(unittest.TestCase):
+    """A fake GitHub release, signed with a test key; nothing is installed."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        key = os.path.join(self.tmp, "key")
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "test", "-f", key], check=True)
+        with open(key + ".pub") as f:
+            public = " ".join(f.read().split()[:2])
+        self.signers = os.path.join(self.tmp, "allowed_signers")
+        with open(self.signers, "w") as f:
+            f.write(f'{turboctl.SIGNER} namespaces="{turboctl.SIGNER}" {public}\n')
+        self.key = key
+        self.settings = os.path.join(self.tmp, "install.env")
+        with open(self.settings, "w") as f:
+            f.write("PREFIX=/usr\nNOPASSWD=1\n")
+        self.installs = []
+
+    def release(self, version, tamper=False):
+        """Build turboctl-VERSION.tar.gz from this tree with that version, and sign it."""
+        top = f"turboctl-{version}"
+        tree = os.path.join(self.tmp, top)
+        shutil.copytree(os.path.join(ROOT, "tests"), os.path.join(tree, "tests"))
+        with open(os.path.join(ROOT, "turboctl")) as f:
+            source = f.read().replace(f'__version__ = "{turboctl.__version__}"', f'__version__ = "{version}"')
+        with open(os.path.join(tree, "turboctl"), "w") as f:
+            f.write(source)
+        archive = os.path.join(self.tmp, top + ".tar.gz")
+        with tarfile.open(archive, "w:gz") as tar:
+            tar.add(tree, top)
+        subprocess.run(["ssh-keygen", "-Y", "sign", "-q", "-f", self.key, "-n", turboctl.SIGNER, archive], check=True)
+        if tamper:
+            with open(archive, "ab") as f:
+                f.write(b"\0")
+        files = {top + ".tar.gz": archive, top + ".tar.gz.sig": archive + ".sig"}
+        return {
+            "tag_name": f"v{version}",
+            "assets": [{"name": name, "browser_download_url": path} for name, path in files.items()],
+        }
+
+    def run_update(self, release):
+        def fetch(url):
+            if url == turboctl.LATEST_RELEASE:
+                return io.BytesIO(json.dumps(release).encode())
+            with open(url, "rb") as f:
+                return io.BytesIO(f.read())
+
+        real_run = subprocess.run
+
+        def run(args, **kwargs):
+            if args[:2] == ["sh", "install.sh"]:
+                self.installs.append((args, kwargs["env"]["PREFIX"]))
+                return subprocess.CompletedProcess(args, 0)
+            return real_run(args, **kwargs)
+
+        with mock.patch.multiple(turboctl, fetch=fetch, ALLOWED_SIGNERS=self.signers, INSTALL_FILE=self.settings), \
+                mock.patch.object(turboctl.subprocess, "run", run), mock.patch("builtins.print"):
+            turboctl.update()
+
+    def test_installs_a_newer_signed_release(self):
+        self.run_update(self.release("99.0.0"))
+        self.assertEqual(self.installs, [(["sh", "install.sh", "--update"], "/usr")])
+
+    def test_refuses_a_modified_archive(self):
+        with self.assertRaises(SystemExit) as caught:
+            self.run_update(self.release("99.0.0", tamper=True))
+        self.assertIn("bad signature", str(caught.exception))
+        self.assertEqual(self.installs, [])
+
+    def test_ignores_an_older_release(self):
+        self.run_update(self.release("1.0.0"))
+        self.assertEqual(self.installs, [])
+
+    def test_package_installs_are_left_to_the_package_manager(self):
+        os.remove(self.settings)
+        with self.assertRaises(SystemExit):
+            self.run_update(self.release("99.0.0"))
+        self.assertEqual(self.installs, [])
 
 
 if __name__ == "__main__":

@@ -1,21 +1,26 @@
 #!/usr/bin/python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""turboctl: tame Intel Turbo Boost instead of disabling it.
+"""turboctl: tame Intel Turbo Boost and AMD Precision Boost instead of disabling them.
 
 Usage:
   turboctl status                 show the CPU and the limits in place
   turboctl monitor                temperature, power, ratio and active limit, once a second
   turboctl apply [PROFILE]        apply PROFILE, or the saved profile
   turboctl set PROFILE            apply and save PROFILE (off, cool, stock or custom)
-  turboctl undervolt MV           core and cache voltage offset, 0 to -100 mV
-  turboctl uvtest [FROM [TO]]     undervolt stability test, default -20 to -100 mV
+  turboctl undervolt MV           core and cache voltage offset, 0 to -100 mV (Intel)
+  turboctl uvtest [FROM [TO]]     undervolt stability test, default -20 to -100 mV (Intel)
   turboctl serve                  JSON backend used by turboctl-gui
+  turboctl watch                  keep the AMD power limits when the firmware raises them (service)
+  turboctl update                 install the latest signed release, if newer (install.sh installs)
   turboctl clean-shutdown         run at shutdown by turboctl-shutdown.service
   turboctl --version
 
-Supported: Intel Core 4th to 10th generation (Haswell to Comet Lake), up to 8 cores.
+Supported: Intel Core 4th to 10th generation (Haswell to Comet Lake), up to 8 cores;
+AMD Ryzen with the amd-pstate or acpi-cpufreq driver, plus power and temperature
+limits on Ryzen 6000/7035 (Rembrandt), 7040/8040 (Phoenix, Hawk Point) and 200 series.
 """
 import errno
+import fcntl
 import json
 import mmap
 import os
@@ -25,9 +30,13 @@ import shutil
 import struct
 import subprocess
 import sys
+import tarfile
+import tempfile
 import time
+import urllib.error
+import urllib.request
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 STATE_DIR = "/var/lib/turboctl"
 PROFILE_FILE = STATE_DIR + "/profile"
@@ -38,8 +47,18 @@ UNDERVOLT_PENDING = STATE_DIR + "/undervolt-pending"
 # Holds the mV that was active when a boot ended without a clean shutdown.
 UNDERVOLT_CRASH = STATE_DIR + "/undervolt-crash"
 UVTEST_LOG = STATE_DIR + "/uvtest.log"
+# Written by install.sh (not by packages): its settings, used again by "update".
+INSTALL_FILE = STATE_DIR + "/install.env"
+LATEST_RELEASE = "https://api.github.com/repos/IOTech17/turboctl/releases/latest"
+# Public key of the releases; an update is installed only if its signature matches.
+ALLOWED_SIGNERS = "@DATADIR@/turboctl/allowed_signers"  # filled in by install.sh
+SIGNER = "turboctl-release"  # identity and namespace of the release signatures
 # Factory limits, captured before turboctl's first write of each boot.
 FACTORY_FILE = "/run/turboctl/factory.json"
+# Power and temperature limits written to the SMU this boot, kept by "watch".
+APPLIED_FILE = "/run/turboctl/applied.json"
+APPLY_LOCK = "/run/turboctl/apply.lock"
+WATCH_SECONDS = 3
 
 NO_TURBO = "/sys/devices/system/cpu/intel_pstate/no_turbo"  # intel_pstate
 BOOST = "/sys/devices/system/cpu/cpufreq/boost"  # acpi-cpufreq
@@ -79,6 +98,33 @@ LIMIT_REASON_BITS = {0: "PROCHOT", 1: "THERMAL", 10: "PL1", 11: "PL2", 12: "MAX_
 
 MCHBAR_PCI_CONFIG = "/sys/bus/pci/devices/0000:00:00.0/config"
 MCHBAR_PL_OFFSET = 0x59A0  # MMIO mirror of the package power limits
+
+# AMD: (family, model) -> name, for Ryzen whose SMU firmware takes power and
+# temperature limits the way RyzenAdj sends them (github.com/FlyGoat/RyzenAdj).
+AMD_SMU_MODELS = {
+    (0x19, 0x44): "Rembrandt",
+    (0x19, 0x40): "Rembrandt",
+    (0x19, 0x74): "Phoenix",
+    (0x19, 0x78): "Phoenix",
+    (0x19, 0x75): "Hawk Point",
+}
+AMD_TESTED_MODELS = {(0x19, 0x75)}
+CPUFREQ = "/sys/devices/system/cpu/cpufreq"
+AMD_MIN_FREQ = 1500  # MHz, lowest frequency cap offered
+SMN_INDEX, SMN_DATA = 0xB8, 0xBC  # in the PCI config space of the root complex (MCHBAR_PCI_CONFIG)
+SMU_MP1 = (0x3B10528, 0x3B10578, 0x3B10998)  # message, response and first argument registers
+SMU_PSMU = (0x3B10A20, 0x3B10A80, 0x3B10A88)
+SMU_OK = 0x1
+SMU_TEST = 0x1
+SMU_SET_STAPM, SMU_SET_SLOW, SMU_SET_TCTL = 0x14, 0x16, 0x19  # MP1, in mW and C
+SMU_TABLE_VERSION, SMU_TABLE_ADDRESS, SMU_TABLE_TRANSFER = 0x6, 0x66, 0x65  # PSMU
+SMU_LOCK = "/run/turboctl/smu.lock"
+# Floats in the PM table: limits and current values, in W and C.
+PM_STAPM_LIMIT, PM_STAPM_VALUE, PM_FAST_LIMIT, PM_SLOW_LIMIT, PM_SLOW_VALUE = 0x0, 0x4, 0x8, 0x10, 0x14
+PM_TCTL_LIMIT, PM_TCTL_VALUE = 0x40, 0x44  # only in the table versions below
+PM_TCTL_TABLES = (0x370000, 0x370001, 0x370002, 0x370003, 0x370004, 0x370005, 0x400001, 0x400002, 0x400003,
+                  0x400004, 0x400005, 0x450004, 0x450005, 0x4C0006, 0x4C0007, 0x4C0008, 0x4C0009)
+PM_TABLE_BYTES = 0x80
 
 UNDERVOLT_PLANES = (0, 2)  # core and cache, which must share the same offset
 UNDERVOLT_MIN = -100
@@ -182,10 +228,12 @@ def detect_cpu():
         fields[key.strip()] = value.strip()
     model = int(fields.get("model", "0"))
     name = fields.get("model name", "unknown CPU")
+    if fields.get("vendor_id") == "AuthenticAMD":
+        return detect_amd(fields)
     if fields.get("vendor_id") != "GenuineIntel" or fields.get("cpu family") != "6" or model not in SUPPORTED_MODELS:
         sys.exit(
             f"turboctl: {name} (model {model:#x}) is not supported; "
-            "supported CPUs are Intel Core 4th to 10th generation (Haswell to Comet Lake)"
+            "supported CPUs are Intel Core 4th to 10th generation (Haswell to Comet Lake) and AMD Ryzen"
         )
     cores = int(fields.get("cpu cores", "0"))
     if not 1 <= cores <= MAX_CORES:
@@ -282,7 +330,286 @@ def clear_turbo_disable_bit():
         wrmsr(MSR_MISC_ENABLE, misc & ~TURBO_DISABLE_BIT)
 
 
+# ---------------------------------------------------------------- AMD
+
+
+def policies():
+    return sorted(
+        (os.path.join(CPUFREQ, name) for name in os.listdir(CPUFREQ) if name.startswith("policy")),
+        key=lambda path: int(path.rsplit("policy", 1)[1]),
+    )
+
+
+def round_mhz(khz):
+    return int(khz) // 100000 * 100  # down to 100 MHz
+
+
+class Smu:
+    """Mailboxes of the AMD system management unit, reached through SMN registers.
+
+    Every request holds a lock: two interleaved requests would write to the wrong register.
+    """
+
+    def __init__(self):
+        self.fd = os.open(MCHBAR_PCI_CONFIG, os.O_RDWR)
+        os.makedirs(os.path.dirname(SMU_LOCK), exist_ok=True)
+        self.lock = os.open(SMU_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+        self.table_address = None
+
+    def read(self, address):
+        os.pwrite(self.fd, struct.pack("<I", address), SMN_INDEX)
+        return struct.unpack("<I", os.pread(self.fd, 4, SMN_DATA))[0]
+
+    def write(self, address, value):
+        os.pwrite(self.fd, struct.pack("<I", address), SMN_INDEX)
+        os.pwrite(self.fd, struct.pack("<I", value), SMN_DATA)
+
+    def request(self, mailbox, message, argument=0):
+        """Send one message; return the response code and the six argument registers."""
+        message_reg, response_reg, args_reg = mailbox
+        fcntl.flock(self.lock, fcntl.LOCK_EX)
+        try:
+            self.write(response_reg, 0)
+            for index in range(6):
+                self.write(args_reg + 4 * index, argument if index == 0 else 0)
+            self.write(message_reg, message)
+            deadline = time.monotonic() + 1
+            while not (response := self.read(response_reg)):
+                if time.monotonic() > deadline:
+                    raise OSError(errno.ETIMEDOUT, f"the SMU did not answer message {message:#x}")
+                time.sleep(0.001)
+            return response, [self.read(args_reg + 4 * index) for index in range(6)]
+        finally:
+            fcntl.flock(self.lock, fcntl.LOCK_UN)
+
+    def test(self):
+        for mailbox in (SMU_MP1, SMU_PSMU):
+            if self.request(mailbox, SMU_TEST, 0x47)[0] != SMU_OK:
+                raise Unsupported("the SMU does not answer")
+
+    def open_table(self):
+        """Find the PM table, where the SMU publishes its limits and readings."""
+        response, args = self.request(SMU_PSMU, SMU_TABLE_VERSION)
+        if response != SMU_OK or not args[0]:
+            raise Unsupported("the SMU does not report its PM table")
+        self.table_version = args[0]
+        response, args = self.request(SMU_PSMU, SMU_TABLE_ADDRESS)
+        address = args[1] << 32 | args[0]
+        if response != SMU_OK or not address:
+            raise Unsupported("the SMU does not report its PM table address")
+        self.table_address = address
+        self.table()  # fails here rather than later if /dev/mem is refused
+
+    def table(self):
+        """Return the start of the PM table, refreshed, as a function of offset -> float."""
+        for _attempt in range(3):
+            if self.request(SMU_PSMU, SMU_TABLE_TRANSFER)[0] == SMU_OK:
+                break
+            time.sleep(0.01)  # rejected when asked too often
+        page, offset = self.table_address & ~0xFFF, self.table_address & 0xFFF
+        try:
+            fd = os.open("/dev/mem", os.O_RDONLY)
+        except PermissionError as err:
+            raise Unsupported("/dev/mem access refused") from err
+        try:
+            area = mmap.mmap(fd, offset + PM_TABLE_BYTES, mmap.MAP_SHARED, mmap.PROT_READ, offset=page)
+        except OSError as err:
+            raise Unsupported("the kernel refused to map the SMU table; boot with iomem=relaxed") from err
+        finally:
+            os.close(fd)
+        data = area[offset:offset + PM_TABLE_BYTES]
+        area.close()
+        return lambda at: round(struct.unpack_from("<f", data, at)[0], 1)
+
+    def set(self, message, value):
+        response = self.request(SMU_MP1, message, value)[0]
+        if response != SMU_OK:
+            raise OSError(errno.EIO, f"the SMU refused message {message:#x} (response {response:#x})")
+
+
+def detect_amd(fields):
+    name = re.sub(r"\s+", " ", fields.get("model name", "unknown CPU"))
+    family, model = int(fields.get("cpu family", "0")), int(fields.get("model", "0"))
+    if family < 0x17 or not os.path.exists(BOOST) or not policies():
+        sys.exit(f"turboctl: {name} is not supported; AMD needs Ryzen with the amd-pstate or acpi-cpufreq driver")
+    policy = policies()[0]
+    cpu = {
+        "vendor": "amd",
+        "name": name,
+        "generation": AMD_SMU_MODELS.get((family, model), f"family {family:#x} model {model:#x}"),
+        "tested": (family, model) in AMD_TESTED_MODELS,
+        "cores": int(fields.get("cpu cores", "0")) or len(core_cpus()),
+        # cpuinfo_max_freq drops to the base frequency while turbo is off; amd_pstate_max_freq does not.
+        "max_freq": round_mhz(read_text(policy + "/amd_pstate_max_freq" if os.path.exists(
+            policy + "/amd_pstate_max_freq") else policy + "/cpuinfo_max_freq")),
+        "min_freq": AMD_MIN_FREQ,
+        "smu": None,
+        "smu_note": None,
+        "tctl": False,
+    }
+    if (family, model) not in AMD_SMU_MODELS:
+        cpu["smu_note"] = "smu_unsupported"
+        return cpu
+    try:
+        smu = Smu()
+        smu.test()
+        smu.open_table()
+    except (OSError, Unsupported) as err:
+        cpu["smu_note"] = "smu_unavailable"
+        cpu["smu_error"] = str(err)
+        return cpu
+    cpu["smu"] = smu
+    cpu["tctl"] = smu.table_version in PM_TCTL_TABLES
+    return cpu
+
+
+def amd_limits(cpu):
+    """Return the limits in place: max frequency, and power and temperature from the SMU."""
+    limits = {"max_freq": round_mhz(read_text(policies()[0] + "/scaling_max_freq"))}
+    if cpu["smu"]:
+        table = cpu["smu"].table()
+        limits["power"] = table(PM_STAPM_LIMIT)
+        limits["slow"] = table(PM_SLOW_LIMIT)
+        limits["fast"] = table(PM_FAST_LIMIT)
+        if cpu["tctl"]:
+            limits["temp"] = table(PM_TCTL_LIMIT)
+    return limits
+
+
+def amd_fields(cpu):
+    return ["max_freq"] + (["power"] if cpu["smu"] else []) + (["temp"] if cpu["tctl"] else [])
+
+
+def amd_bounds(cpu, factory):
+    limits = {"max_freq": [cpu["min_freq"], cpu["max_freq"]]}
+    if "power" in factory:
+        sustained = int(max(factory["power"], factory["slow"]))
+        limits["power"] = [max(5, round(sustained * 0.3)), sustained]
+    if "temp" in factory:
+        limits["temp"] = [60, int(factory["temp"])]
+    return limits
+
+
+def amd_stock(cpu, factory):
+    stock = {"max_freq": cpu["max_freq"]}
+    if "power" in factory:
+        stock["power"] = int(max(factory["power"], factory["slow"]))
+    if "temp" in factory:
+        stock["temp"] = int(factory["temp"])
+    return stock
+
+
+def amd_cool(cpu, factory):
+    limits = amd_bounds(cpu, factory)
+    cool = {"max_freq": cpu["max_freq"]}
+    if "power" in limits:
+        cool["power"] = max(limits["power"][0], int(limits["power"][1] * 0.65))
+    if "temp" in limits:
+        cool["temp"] = max(limits["temp"][0], min(limits["temp"][1], 85))
+    return cool
+
+
+def amd_valid(profile, cpu, factory):
+    limits = amd_bounds(cpu, factory)
+    return (
+        set(profile) == {"turbo", *limits}
+        and isinstance(profile["turbo"], bool)
+        and all(type(profile[key]) is int and low <= profile[key] <= high for key, (low, high) in limits.items())
+        and profile["max_freq"] % 100 == 0
+    )
+
+
+def amd_write_max_freq(mhz):
+    """Cap every core; run after the turbo switch, which resets the cap."""
+    for policy in policies():
+        # Without turbo the hardware ceiling drops to the base frequency.
+        target = min(mhz * 1000, int(read_text(policy + "/cpuinfo_max_freq")))
+        write_text(policy + "/scaling_max_freq", str(target))
+        # Right after a turbo switch, the kernel takes a moment to apply the new cap.
+        for _ in range(20):
+            applied = int(read_text(policy + "/scaling_max_freq"))
+            if round_mhz(applied) == round_mhz(target):
+                break
+            time.sleep(0.05)
+        else:
+            raise OSError(errno.EIO, f"max frequency not applied, read {applied // 1000} MHz")
+
+
+def amd_write_limits(cpu, profile):
+    smu = cpu["smu"]
+    if not smu:
+        return
+    # STAPM is the long average and slow PPT the sustained one: both get the same limit.
+    smu.set(SMU_SET_STAPM, profile["power"] * 1000)
+    smu.set(SMU_SET_SLOW, profile["power"] * 1000)
+    if cpu["tctl"]:
+        smu.set(SMU_SET_TCTL, profile["temp"])
+    applied = amd_limits(cpu)
+    if applied["power"] != profile["power"] or applied["slow"] != profile["power"]:
+        raise OSError(errno.EIO, f"power limit not applied, read {applied['power']:g} / {applied['slow']:g} W")
+    if cpu["tctl"] and applied["temp"] != profile["temp"]:
+        raise OSError(errno.EIO, f"temperature limit not applied, read {applied['temp']:g} C")
+
+
+def hwmon(name):
+    for entry in os.listdir("/sys/class/hwmon"):
+        path = os.path.join("/sys/class/hwmon", entry)
+        try:
+            if read_text(path + "/name") == name:
+                return path
+        except OSError:
+            continue
+    return None
+
+
+def amd_temp():
+    path = hwmon("k10temp")
+    return round(int(read_text(path + "/temp1_input")) / 1000) if path else 0
+
+
+def amd_power_sampler():
+    """Return a function giving the average package watts since its previous call (RAPL)."""
+    zone = "/sys/class/powercap/intel-rapl:0"  # the kernel names it intel-rapl on AMD too
+    if not os.path.exists(zone + "/energy_uj"):
+        return lambda: 0.0
+    wrap = int(read_text(zone + "/max_energy_range_uj")) + 1
+    last_energy, last_time = int(read_text(zone + "/energy_uj")), time.monotonic()
+
+    def sample():
+        nonlocal last_energy, last_time
+        energy, now = int(read_text(zone + "/energy_uj")), time.monotonic()
+        watts = ((energy - last_energy) % wrap) / 1e6 / max(now - last_time, 1e-3)
+        last_energy, last_time = energy, now
+        return watts
+
+    return sample
+
+
+def amd_active_limits(cpu):
+    if not cpu["smu"]:
+        return []
+    try:
+        table = cpu["smu"].table()
+    except (OSError, Unsupported):
+        return []
+    limits = []
+    if table(PM_STAPM_VALUE) >= table(PM_STAPM_LIMIT) * 0.97 or table(PM_SLOW_VALUE) >= table(PM_SLOW_LIMIT) * 0.97:
+        limits.append("POWER")
+    if cpu["tctl"] and table(PM_TCTL_VALUE) >= table(PM_TCTL_LIMIT) - 1:
+        limits.append("THERMAL")
+    return limits
+
+
+def amd_freqs():
+    path = "/sys/devices/system/cpu/cpu{}/cpufreq/scaling_cur_freq"
+    return [round(int(read_text(path.format(c))) / 1000) for c in core_cpus()]
+
+
 # ---------------------------------------------------------------- profiles
+
+
+def is_amd(cpu):
+    return cpu.get("vendor") == "amd"
 
 
 def factory_limits(cpu):
@@ -290,11 +617,15 @@ def factory_limits(cpu):
     try:
         with open(FACTORY_FILE) as f:
             factory = json.load(f)
-        if len(factory["ratios"]) == cpu["cores"]:
+        if is_amd(cpu) and set(amd_limits(cpu)) <= set(factory):
+            return factory
+        if not is_amd(cpu) and len(factory["ratios"]) == cpu["cores"]:
             return factory
     except (OSError, ValueError, KeyError, TypeError):
         pass
     # Nothing written yet this boot, so the registers still hold the factory values.
+    if is_amd(cpu):
+        return dict(amd_limits(cpu), max_freq=cpu["max_freq"])
     return {"ratios": get_ratios(cpu), "tcc": get_tcc(cpu), "pl1": msr_pl1(cpu)}
 
 
@@ -307,6 +638,8 @@ def record_factory_limits(cpu):
 
 
 def bounds(cpu, factory):
+    if is_amd(cpu):
+        return amd_bounds(cpu, factory)
     return {
         "ratio": [cpu["base_ratio"], max(factory["ratios"])],
         "pl1": [max(5, round(factory["pl1"] * 0.3)), int(factory["pl1"])],
@@ -316,15 +649,18 @@ def bounds(cpu, factory):
 
 
 def build_profiles(cpu, factory):
-    stock = {"ratios": factory["ratios"], "pl1": int(factory["pl1"]), "tcc": factory["tcc"]}
-    limits = bounds(cpu, factory)
-    # "cool": one ratio step less per extra active core, 65 % of PL1, throttle 15 C below TjMax.
-    # On an i7-5700HQ this keeps a sustained all-core load around 85 C.
-    cool = {
-        "ratios": [max(cpu["base_ratio"], ratio - i) for i, ratio in enumerate(factory["ratios"])],
-        "pl1": max(limits["pl1"][0], int(factory["pl1"] * 0.65)),
-        "tcc": max(limits["tcc"][0], min(factory["tcc"], cpu["tjmax"] - 15)),
-    }
+    if is_amd(cpu):
+        stock, cool = amd_stock(cpu, factory), amd_cool(cpu, factory)
+    else:
+        stock = {"ratios": factory["ratios"], "pl1": int(factory["pl1"]), "tcc": factory["tcc"]}
+        limits = bounds(cpu, factory)
+        # "cool": one ratio step less per extra active core, 65 % of PL1, throttle 15 C below TjMax.
+        # On an i7-5700HQ this keeps a sustained all-core load around 85 C.
+        cool = {
+            "ratios": [max(cpu["base_ratio"], ratio - i) for i, ratio in enumerate(factory["ratios"])],
+            "pl1": max(limits["pl1"][0], int(factory["pl1"] * 0.65)),
+            "tcc": max(limits["tcc"][0], min(factory["tcc"], cpu["tjmax"] - 15)),
+        }
     profiles = {
         "off": dict(stock, turbo=False),
         "cool": dict(cool, turbo=True),
@@ -339,6 +675,8 @@ def build_profiles(cpu, factory):
 def valid_profile(profile, cpu, factory):
     if not isinstance(profile, dict):
         return False
+    if is_amd(cpu):
+        return amd_valid(profile, cpu, factory)
     limits = bounds(cpu, factory)
     ratios, pl1, tcc = profile.get("ratios"), profile.get("pl1"), profile.get("tcc")
     low, high = limits["ratio"]
@@ -378,6 +716,9 @@ def save_profile(name):
 
 
 def write_limits(cpu, profile):
+    if is_amd(cpu):
+        amd_write_limits(cpu, profile)
+        return
     if cpu["ratio_writable"]:
         old = rdmsr(MSR_TURBO_RATIO_LIMIT)
         mask = (1 << (8 * cpu["cores"])) - 1
@@ -407,19 +748,73 @@ def set_pl1(cpu, watts):
         raise OSError(errno.EIO, f"PL1 not applied, read {applied:g} W")
 
 
+def lock(path):
+    """Take an exclusive lock; release it with os.close() on the returned descriptor."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
 def apply(cpu, profiles, name):
     profile = profiles[name]
+    fd = lock(APPLY_LOCK)  # keeps "watch" from restoring the previous limits halfway
     try:
+        remove(APPLIED_FILE)
         record_factory_limits(cpu)
-        if profile["turbo"]:
+        if profile["turbo"] and not is_amd(cpu):
             clear_turbo_disable_bit()
         # Turbo stays off until every limit is confirmed, and stays off on failure.
         set_turbo(False)
         write_limits(cpu, profile)
-        write_undervolt(checked_undervolt())
-        set_turbo(profile["turbo"])
+        if is_amd(cpu):
+            if cpu["smu"]:
+                with open(APPLIED_FILE, "w") as f:
+                    json.dump({key: profile[key] for key in ("power", "temp") if key in profile}, f)
+            set_turbo(profile["turbo"])
+            amd_write_max_freq(profile["max_freq"])
+        else:
+            write_undervolt(checked_undervolt())
+            set_turbo(profile["turbo"])
     except (OSError, Unsupported) as err:
+        try:
+            set_turbo(False)
+        except OSError:
+            pass
         sys.exit(f"turboctl: {getattr(err, 'strerror', None) or err}; turbo left disabled")
+    finally:
+        os.close(fd)
+
+
+def watch(cpu):
+    """Write the AMD power and temperature limits again when the firmware raises them.
+
+    A power profile change (power-profiles-daemon, amd_pmf) restores the firmware's power
+    limits. Lower limits set by the firmware, as in power saving mode, are left in place.
+    """
+    if not is_amd(cpu) or not cpu["smu"]:
+        return
+    last_error = None
+    while True:
+        time.sleep(WATCH_SECONDS)
+        fd = lock(APPLY_LOCK)
+        try:
+            with open(APPLIED_FILE) as f:
+                applied = json.load(f)
+            current = amd_limits(cpu)
+            too_hot = "temp" in applied and current["temp"] > applied["temp"]
+            if max(current["power"], current["slow"]) > applied["power"] or too_hot:
+                amd_write_limits(cpu, applied)
+                print(f"limits raised by the firmware, set back to {applied['power']} W", flush=True)
+            last_error = None
+        except FileNotFoundError:
+            pass  # no profile applied yet this boot
+        except (OSError, ValueError, KeyError, Unsupported) as err:
+            if str(err) != last_error:
+                print(f"turboctl: {err}", file=sys.stderr, flush=True)
+                last_error = str(err)
+        finally:
+            os.close(fd)
 
 
 # ---------------------------------------------------------------- undervolt
@@ -553,7 +948,64 @@ def core_ratios():
     return [(rdmsr(MSR_PERF_STATUS, c) >> 8) & 0xFF for c in core_cpus()]
 
 
+def cpu_temp(cpu):
+    return amd_temp() if is_amd(cpu) else package_temp(cpu)
+
+
+def cpu_power_sampler(cpu):
+    return amd_power_sampler() if is_amd(cpu) else power_sampler()
+
+
+def cpu_active_limits(cpu):
+    return amd_active_limits(cpu) if is_amd(cpu) else active_limits()
+
+
+def core_freqs(cpu):
+    """MHz of each physical core."""
+    return amd_freqs() if is_amd(cpu) else [ratio * 100 for ratio in core_ratios()]
+
+
+def fields(cpu):
+    return amd_fields(cpu) if is_amd(cpu) else ["ratios", "pl1", "tcc"]
+
+
+def current_values(cpu):
+    """The settings in place, by field name (None if unreadable)."""
+    if is_amd(cpu):
+        try:
+            limits = amd_limits(cpu)
+        except (OSError, Unsupported):
+            return {}
+        return {key: limits.get(key) for key in amd_fields(cpu)}
+    try:
+        pl1 = power_limits(cpu)[0]
+    except (OSError, Unsupported):
+        pl1 = None
+    return {"ratios": get_ratios(cpu), "pl1": pl1, "tcc": get_tcc(cpu)}
+
+
+def amd_status(cpu, profiles):
+    note = "" if cpu["tested"] else "  (untested)"
+    print(f"cpu           : {cpu['name']}, {cpu['generation']}, {cpu['cores']} cores{note}")
+    print(f"saved profile : {saved_profile(profiles)}")
+    print(f"turbo         : {'enabled' if get_turbo() else 'disabled'}")
+    limits = amd_limits(cpu)
+    print(f"max frequency : {limits['max_freq'] / 1000:.1f} GHz (hardware {cpu['max_freq'] / 1000:.1f} GHz)")
+    if cpu["smu"]:
+        table = f"PM table {cpu['smu'].table_version:#x}"
+        print(f"power limits  : STAPM {limits['power']:g} W, slow {limits['slow']:g} W, fast {limits['fast']:g} W")
+        temp = f"{limits['temp']:g} C" if cpu["tctl"] else "unknown for this table version"
+        print(f"throttle at   : {temp} ({table})")
+    elif cpu["smu_note"] == "smu_unsupported":
+        print("power limits  : not supported on this CPU family (frequency and turbo only)")
+    else:
+        print(f"power limits  : unavailable ({cpu['smu_error']})")
+
+
 def status(cpu, profiles):
+    if is_amd(cpu):
+        amd_status(cpu, profiles)
+        return
     note = "" if cpu["tested"] else "  (untested generation)"
     print(f"cpu           : {cpu['name']}, {cpu['generation']}, {cpu['cores']} cores{note}")
     print(f"saved profile : {saved_profile(profiles)}")
@@ -572,12 +1024,12 @@ def status(cpu, profiles):
 
 
 def monitor(cpu):
-    sample_watts = power_sampler()
-    print("temp_C watts ratio limits", flush=True)
+    sample_watts = cpu_power_sampler(cpu)
+    print("temp_C watts MHz limits", flush=True)
     while True:
         time.sleep(1)
-        ratio = max(core_ratios())
-        print(f"{package_temp(cpu)} {sample_watts():.1f} {ratio} {','.join(active_limits()) or '-'}", flush=True)
+        limits = ",".join(cpu_active_limits(cpu)) or "-"
+        print(f"{cpu_temp(cpu)} {sample_watts():.1f} {max(core_freqs(cpu))} {limits}", flush=True)
 
 
 # ---------------------------------------------------------------- GUI backend
@@ -588,6 +1040,8 @@ def handle_request(cpu, factory, raw):
     try:
         request = json.loads(raw)
         if "undervolt" in request:
+            if is_amd(cpu):
+                return "undervolting is not available on AMD CPUs"
             if not valid_undervolt(request["undervolt"]):
                 return "undervolt out of range"
             set_undervolt(request["undervolt"])
@@ -618,7 +1072,7 @@ def handle_request(cpu, factory, raw):
 def serve(cpu):
     """Stream the state as JSON lines each second and apply requests read from stdin."""
     factory = factory_limits(cpu)
-    sample_watts = power_sampler()
+    sample_watts = cpu_power_sampler(cpu)
     watts, error = 0.0, None
     while True:
         if select.select([0], [], [], 1)[0]:
@@ -630,34 +1084,107 @@ def serve(cpu):
         else:
             watts = sample_watts()
         profiles = build_profiles(cpu, factory)
-        try:
-            pl1, pl2 = power_limits(cpu)
-        except (OSError, Unsupported):
-            pl1 = pl2 = None
+        values = current_values(cpu)
+        if is_amd(cpu):
+            writable = {key: True for key in amd_fields(cpu)}
+        else:
+            writable = {"ratios": cpu["ratio_writable"], "pl1": values["pl1"] is not None, "tcc": cpu["tcc_writable"]}
         state = {
             "version": __version__,
-            "cpu": {k: cpu[k] for k in ("name", "generation", "tested", "cores", "tjmax")},
-            "writable": {"ratios": cpu["ratio_writable"], "tcc": cpu["tcc_writable"]},
+            "cpu": {k: cpu[k] for k in ("name", "generation", "tested", "cores")},
+            "fields": fields(cpu),
+            "writable": writable,
             "bounds": bounds(cpu, factory),
             "profile": saved_profile(profiles),
             "profiles": profiles,
             "turbo": get_turbo(),
-            "ratios": get_ratios(cpu),
-            "pl1": pl1,
-            "pl2": pl2,
-            "tcc": get_tcc(cpu),
-            "temp": package_temp(cpu),
+            "values": values,
+            "temp": cpu_temp(cpu),
             "watts": round(watts, 1),
-            "freqs": core_ratios(),
-            "limits": active_limits(),
-            "undervolt": saved_undervolt(),
-            "undervolt_crash": undervolt_crash(),
+            "freqs": core_freqs(cpu),
+            "limits": cpu_active_limits(cpu),
+            "notes": [cpu["smu_note"]] if is_amd(cpu) and cpu["smu_note"] else [],
+            "undervolt": None if is_amd(cpu) else saved_undervolt(),
+            "undervolt_crash": None if is_amd(cpu) else undervolt_crash(),
             "error": error,
         }
         try:
             print(json.dumps(state), flush=True)
         except BrokenPipeError:
             return
+
+
+# ---------------------------------------------------------------- update
+
+
+def version_tuple(text):
+    return tuple(int(part) for part in text.split("."))
+
+
+def fetch(url):
+    request = urllib.request.Request(url, headers={"User-Agent": f"turboctl/{__version__}"})
+    return urllib.request.urlopen(request, timeout=60)
+
+
+def read_install_settings():
+    """Return the variables install.sh saved, or None for an install made by a package."""
+    try:
+        with open(INSTALL_FILE) as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return None
+    return dict(line.split("=", 1) for line in lines if "=" in line)
+
+
+def update():
+    """Install the latest release from GitHub if it is newer and signed with the release key."""
+    settings = read_install_settings()
+    if settings is None:
+        sys.exit("turboctl: not installed by install.sh; update it with your package manager")
+    if not shutil.which("ssh-keygen"):
+        sys.exit("turboctl: ssh-keygen (OpenSSH) is needed to check the release signature")
+    try:
+        with fetch(LATEST_RELEASE) as response:
+            release = json.load(response)
+    except (urllib.error.URLError, OSError) as err:
+        print(f"turboctl: cannot reach GitHub ({err}); will try again later")
+        return
+    version = release["tag_name"].lstrip("v")
+    if version_tuple(version) <= version_tuple(__version__):
+        print(f"turboctl {__version__} is up to date")
+        return
+    name = f"turboctl-{version}.tar.gz"
+    assets = {asset["name"]: asset["browser_download_url"] for asset in release["assets"]}
+    if name not in assets or name + ".sig" not in assets:
+        sys.exit(f"turboctl: release {version} has no signed archive")
+    with tempfile.TemporaryDirectory(prefix="turboctl-update-") as tmp:
+        archive = os.path.join(tmp, name)
+        for asset in (name, name + ".sig"):
+            with fetch(assets[asset]) as source, open(os.path.join(tmp, asset), "wb") as target:
+                shutil.copyfileobj(source, target)
+        with open(archive, "rb") as data:
+            verify = subprocess.run(
+                ["ssh-keygen", "-Y", "verify", "-f", ALLOWED_SIGNERS, "-I", SIGNER, "-n", SIGNER,
+                 "-s", archive + ".sig"],
+                stdin=data, capture_output=True, text=True,
+            )
+        if verify.returncode != 0:
+            sys.exit(f"turboctl: bad signature on release {version}, not installed: {verify.stderr.strip()}")
+        with tarfile.open(archive) as tar:
+            # The "data" filter refuses links and paths leaving the directory (Python 3.12, backported).
+            tar.extractall(tmp, **({"filter": "data"} if hasattr(tarfile, "data_filter") else {}))
+        source = os.path.join(tmp, f"turboctl-{version}")
+        found = subprocess.run([sys.executable, "turboctl", "--version"], cwd=source, capture_output=True, text=True)
+        if found.stdout.strip() != f"turboctl {version}":
+            sys.exit(f"turboctl: release {version} contains {found.stdout.strip() or 'no turboctl'}, not installed")
+        tests = subprocess.run(
+            [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_turboctl.py"],
+            cwd=source, capture_output=True, text=True, env=dict(os.environ, TURBOCTL_UPDATING="1"),
+        )
+        if tests.returncode != 0:
+            sys.exit(f"turboctl: release {version} fails its tests on this machine, not installed:\n{tests.stderr}")
+        subprocess.run(["sh", "install.sh", "--update"], cwd=source, env=dict(os.environ, **settings), check=True)
+    print(f"turboctl updated from {__version__} to {version}")
 
 
 # ---------------------------------------------------------------- uvtest
@@ -744,7 +1271,9 @@ def main():
     if command in ("--version", "-V"):
         print(f"turboctl {__version__}")
         return
-    commands = ("status", "monitor", "serve", "apply", "set", "undervolt", "uvtest", "clean-shutdown")
+    commands = (
+        "status", "monitor", "serve", "watch", "update", "apply", "set", "undervolt", "uvtest", "clean-shutdown",
+    )
     if command not in commands or len(args) > (3 if command == "uvtest" else 2):
         sys.exit(__doc__)
     if os.geteuid() != 0:
@@ -752,8 +1281,16 @@ def main():
     if command == "clean-shutdown":
         remove(UNDERVOLT_PENDING)
         return
+    if command == "update":
+        try:
+            update()
+        except subprocess.CalledProcessError as err:
+            sys.exit(f"turboctl: the new install.sh failed ({err.returncode})")
+        return
 
     cpu = detect_cpu()
+    if is_amd(cpu) and command in ("undervolt", "uvtest"):
+        sys.exit("turboctl: undervolting is not available on AMD CPUs")
     try:
         if command == "undervolt":
             values = parse_mv(args[1:], 1)
@@ -773,6 +1310,8 @@ def main():
             monitor(cpu)
         elif command == "serve":
             serve(cpu)
+        elif command == "watch":
+            watch(cpu)
         else:
             profiles = build_profiles(cpu, factory_limits(cpu))
             name = args[1] if len(args) == 2 else saved_profile(profiles)

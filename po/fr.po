@@ -3,6 +3,8 @@
 msgid ""
 msgstr ""
 "Project-Id-Version: turboctl\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2026-11-17 07:53+0000\n"
 "Language: fr\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
@@ -30,8 +32,37 @@ msgstr "puissance (PL1)"
 msgid "power (PL2)"
 msgstr "puissance (PL2)"
 
+msgid "power"
+msgstr "puissance"
+
 msgid "temperature"
 msgstr "température"
+
+msgid "Max power (PL1)"
+msgstr "Puissance max (PL1)"
+
+msgid "Throttle at"
+msgstr "Bridage thermique"
+
+msgid "Max frequency"
+msgstr "Fréquence max"
+
+msgid "Sustained power"
+msgstr "Puissance soutenue"
+
+msgid ""
+"Power and temperature limits are not supported on this CPU: turbo and "
+"frequency only."
+msgstr ""
+"Limites de puissance et de température non prises en charge sur ce CPU : "
+"turbo et fréquence seulement."
+
+msgid ""
+"Power and temperature limits are unavailable: run “sudo turboctl status” for "
+"the reason."
+msgstr ""
+"Limites de puissance et de température indisponibles : lancez « sudo "
+"turboctl status » pour en connaître la raison."
 
 msgid "Turbo Boost"
 msgstr "Turbo Boost"
@@ -44,6 +75,15 @@ msgstr "Ouvrir Turbo Boost"
 
 msgid "Quit"
 msgstr "Quitter"
+
+msgid "System default"
+msgstr "Langue du système"
+
+msgid "Language"
+msgstr "Langue"
+
+msgid "Changes not applied"
+msgstr "Modifications non appliquées"
 
 msgid "Temperature"
 msgstr "Température"
@@ -60,14 +100,9 @@ msgstr "Turbo"
 msgid "1 active core"
 msgstr "1 cœur actif"
 
+#, python-brace-format
 msgid "{} active cores"
 msgstr "{} cœurs actifs"
-
-msgid "Max power (PL1)"
-msgstr "Puissance max (PL1)"
-
-msgid "Throttle at"
-msgstr "Bridage thermique"
 
 msgid "Apply"
 msgstr "Appliquer"
@@ -75,13 +110,14 @@ msgstr "Appliquer"
 msgid "Undervolt"
 msgstr "Sous-voltage"
 
-msgid "Changes not applied"
-msgstr "Modifications non appliquées"
-
 msgid ""
 "This CPU generation is untested: check the readings before relying on it."
 msgstr ""
 "Génération de CPU non testée : vérifiez les mesures avant de vous y fier."
+
+#, python-brace-format
+msgid "Updated to turboctl {}."
+msgstr "Mis à jour vers turboctl {}."
 
 msgid "Cores: "
 msgstr "Cœurs : "
@@ -92,6 +128,7 @@ msgstr "aucune"
 msgid "Active limit: "
 msgstr "Limite active : "
 
+#, python-brace-format
 msgid "Unclean shutdown with {} mV: undervolt reset to 0 mV for safety."
 msgstr "Arrêt anormal avec {} mV : sous-voltage remis à 0 mV par sécurité."
 
@@ -107,9 +144,3 @@ msgid ""
 msgstr ""
 "Autorisation refusée ou CPU non pris en charge. Lancez « sudo turboctl "
 "status » pour en savoir plus."
-
-msgid "System default"
-msgstr "Langue du système"
-
-msgid "Language"
-msgstr "Langue"

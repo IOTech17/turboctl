@@ -1,0 +1,12 @@
+[Unit]
+Description=Keep the turboctl power limits when the firmware raises them (AMD)
+After=turboctl.service
+
+[Service]
+# Exits at once on CPUs without SMU power limits.
+ExecStart=@SBINDIR@/turboctl watch
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

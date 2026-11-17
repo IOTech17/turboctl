@@ -6,7 +6,7 @@
 #   sudo ./uninstall.sh --purge    also remove the saved settings in /var/lib/turboctl
 #   ./uninstall.sh --files-only    only remove the files, for packagers (honours DESTDIR)
 #
-# Use the same PREFIX, SYSCONFDIR and UNITDIR as for install.sh.
+# Use the same PREFIX, SYSCONFDIR, UNITDIR and PRESETDIR as for install.sh.
 set -eu
 
 PREFIX=${PREFIX:-/usr}
@@ -16,6 +16,7 @@ SBINDIR=${SBINDIR:-$PREFIX/sbin}
 DATADIR=${DATADIR:-$PREFIX/share}
 LOCALEDIR=${LOCALEDIR:-$DATADIR/locale}
 UNITDIR=${UNITDIR:-$PREFIX/lib/systemd/system}
+PRESETDIR=${PRESETDIR:-$PREFIX/lib/systemd/system-preset}
 DESTDIR=${DESTDIR:-}
 APP_ID=io.github.iotech17.turboctl
 
@@ -33,6 +34,7 @@ if [ "$files_only" = 0 ] && [ "$(id -u)" != 0 ]; then
 fi
 
 if [ "$files_only" = 0 ]; then
+    systemctl disable --now turboctl-watch.service turboctl-update.timer 2>/dev/null || true
     systemctl disable turboctl.service turboctl-shutdown.service 2>/dev/null || true
     # Stopping the shutdown unit removes the undervolt marker, as at a clean shutdown.
     systemctl stop turboctl-shutdown.service 2>/dev/null || true
@@ -42,6 +44,11 @@ rm -f "$DESTDIR$SBINDIR/turboctl" \
       "$DESTDIR$BINDIR/turboctl-gui" \
       "$DESTDIR$UNITDIR/turboctl.service" \
       "$DESTDIR$UNITDIR/turboctl-shutdown.service" \
+      "$DESTDIR$UNITDIR/turboctl-watch.service" \
+      "$DESTDIR$UNITDIR/turboctl-update.service" \
+      "$DESTDIR$UNITDIR/turboctl-update.timer" \
+      "$DESTDIR$DATADIR/turboctl/allowed_signers" \
+      "$DESTDIR$PRESETDIR/80-turboctl.preset" \
       "$DESTDIR$DATADIR/applications/$APP_ID.desktop" \
       "$DESTDIR$SYSCONFDIR/xdg/autostart/$APP_ID.desktop" \
       "$DESTDIR$DATADIR/icons/hicolor/scalable/apps/turboctl.svg" \
@@ -49,8 +56,10 @@ rm -f "$DESTDIR$SBINDIR/turboctl" \
       "$DESTDIR$DATADIR/polkit-1/rules.d/50-turboctl.rules" \
       "$DESTDIR$LOCALEDIR"/*/LC_MESSAGES/turboctl.mo
 
+rmdir "$DESTDIR$DATADIR/turboctl" 2>/dev/null || true
 [ "$files_only" = 1 ] && exit 0
 
+rm -f /var/lib/turboctl/install.env "$SYSCONFDIR/systemd/system-preset/80-turboctl-update.preset"
 [ "$purge" = 1 ] && rm -rf /var/lib/turboctl
 rm -rf /run/turboctl
 systemctl daemon-reload

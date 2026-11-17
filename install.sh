@@ -4,9 +4,11 @@
 #
 #   sudo ./install.sh [PROFILE]   install, enable the services and apply PROFILE (default: cool)
 #   ./install.sh --files-only     only copy the files, for packagers (honours DESTDIR)
+#   install.sh --update           run by "turboctl update" from a new release: keep the saved profile
 #
-# Variables: PREFIX (/usr), SYSCONFDIR (/etc), UNITDIR, DESTDIR,
-#            NOPASSWD=0 to keep the password prompt (see README).
+# Variables: PREFIX (/usr), SYSCONFDIR (/etc), UNITDIR, PRESETDIR, DESTDIR,
+#            NOPASSWD=0 to keep the password prompt (see README),
+#            AUTO_UPDATE=0 to install new releases by hand.
 set -eu
 cd "$(dirname "$0")"
 
@@ -17,14 +19,18 @@ SBINDIR=${SBINDIR:-$PREFIX/sbin}
 DATADIR=${DATADIR:-$PREFIX/share}
 LOCALEDIR=${LOCALEDIR:-$DATADIR/locale}
 UNITDIR=${UNITDIR:-$PREFIX/lib/systemd/system}
+PRESETDIR=${PRESETDIR:-$PREFIX/lib/systemd/system-preset}
 NOPASSWD=${NOPASSWD:-1}
+AUTO_UPDATE=${AUTO_UPDATE:-1}
 DESTDIR=${DESTDIR:-}
 APP_ID=io.github.iotech17.turboctl
 
 files_only=0
+update=0
 profile=cool
 case "${1:-}" in
     --files-only) files_only=1 ;;
+    --update) update=1 ;;
     "") ;;
     *) profile=$1 ;;
 esac
@@ -38,7 +44,8 @@ trap 'rm -f "$tmp"' EXIT
 
 # put SOURCE TARGET MODE: install with the @...@ paths filled in
 put() {
-    sed -e "s|@SBINDIR@|$SBINDIR|g" -e "s|@BINDIR@|$BINDIR|g" -e "s|@LOCALEDIR@|$LOCALEDIR|g" "$1" > "$tmp"
+    sed -e "s|@SBINDIR@|$SBINDIR|g" -e "s|@BINDIR@|$BINDIR|g" -e "s|@LOCALEDIR@|$LOCALEDIR|g" \
+        -e "s|@DATADIR@|$DATADIR|g" "$1" > "$tmp"
     install -D -m "$3" "$tmp" "$DESTDIR$2"
 }
 
@@ -46,6 +53,11 @@ put turboctl "$SBINDIR/turboctl" 755
 put turboctl-gui "$BINDIR/turboctl-gui" 755
 put data/turboctl.service "$UNITDIR/turboctl.service" 644
 put data/turboctl-shutdown.service "$UNITDIR/turboctl-shutdown.service" 644
+put data/turboctl-watch.service "$UNITDIR/turboctl-watch.service" 644
+put data/turboctl-update.service "$UNITDIR/turboctl-update.service" 644
+put data/turboctl-update.timer "$UNITDIR/turboctl-update.timer" 644
+put data/allowed_signers "$DATADIR/turboctl/allowed_signers" 644
+put data/80-turboctl.preset "$PRESETDIR/80-turboctl.preset" 644
 put data/$APP_ID.desktop "$DATADIR/applications/$APP_ID.desktop" 644
 put data/$APP_ID-autostart.desktop "$SYSCONFDIR/xdg/autostart/$APP_ID.desktop" 644
 put data/turboctl.svg "$DATADIR/icons/hicolor/scalable/apps/turboctl.svg" 644
@@ -70,7 +82,43 @@ fi
 
 gtk-update-icon-cache -q -t "$DATADIR/icons/hicolor" 2>/dev/null || true
 systemctl daemon-reload
-"$SBINDIR/turboctl" set "$profile"
+if [ "$update" = 1 ]; then
+    "$SBINDIR/turboctl" apply
+else
+    "$SBINDIR/turboctl" set "$profile"
+fi
 systemctl enable turboctl.service
 systemctl enable --now turboctl-shutdown.service
-echo "turboctl installed. Start \"Turbo Boost\" from the menu, or log in again for the tray icon."
+systemctl enable turboctl-watch.service
+systemctl restart turboctl-watch.service
+
+# "turboctl update" installs new releases with these settings. Packages do not get
+# this file: their package manager updates them.
+install -d /var/lib/turboctl
+cat > /var/lib/turboctl/install.env <<EOF
+PREFIX=$PREFIX
+SYSCONFDIR=$SYSCONFDIR
+BINDIR=$BINDIR
+SBINDIR=$SBINDIR
+DATADIR=$DATADIR
+LOCALEDIR=$LOCALEDIR
+UNITDIR=$UNITDIR
+PRESETDIR=$PRESETDIR
+NOPASSWD=$NOPASSWD
+AUTO_UPDATE=$AUTO_UPDATE
+EOF
+update_preset="$SYSCONFDIR/systemd/system-preset/80-turboctl-update.preset"
+if [ "$AUTO_UPDATE" = 1 ]; then
+    # In /etc, as the timer is enabled only for this way of installing.
+    install -d "$(dirname "$update_preset")"
+    echo "enable turboctl-update.timer" > "$update_preset"
+    systemctl enable --now turboctl-update.timer
+else
+    rm -f "$update_preset"
+    systemctl disable --now turboctl-update.timer 2>/dev/null || true
+fi
+if [ "$update" = 1 ]; then
+    echo "turboctl updated."
+else
+    echo "turboctl installed. Start \"Turbo Boost\" from the menu, or log in again for the tray icon."
+fi

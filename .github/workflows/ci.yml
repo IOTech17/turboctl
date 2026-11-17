@@ -24,7 +24,7 @@ jobs:
       - name: Lint
         run: |
           pipx run ruff check .
-          shellcheck install.sh uninstall.sh
+          shellcheck install.sh uninstall.sh tools/release.sh
           desktop-file-validate data/*.desktop
           msgfmt --check -o /dev/null po/fr.po
       - name: Staged install

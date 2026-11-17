@@ -1,34 +1,41 @@
 # turboctl
 
-Tame Intel Turbo Boost instead of disabling it.
+Tame Intel Turbo Boost and AMD Precision Boost instead of disabling them.
 
-Many laptops run their CPU at 95-100 °C under sustained load, and the usual fix is to
-disable Turbo Boost entirely. turboctl keeps the turbo bursts and caps what makes the
-heat: the per-core turbo ratios, the long-term power limit (PL1) and the throttle
-temperature. It can also undervolt the CPU, with a guard against unstable values.
+Many laptops run their CPU at 90-100 °C under sustained load, and the usual fix is to
+disable turbo entirely. turboctl keeps the turbo bursts and caps what makes the heat:
+the turbo frequency, the sustained power limit and the throttle temperature. On Intel
+it can also undervolt the CPU, with a guard against unstable values.
 
 - Command line tool, systemd service that reapplies the limits at boot and after sleep
 - GTK 3 window and tray icon showing temperature, power, frequency and the active limit
 - Profiles: `off`, `cool`, `stock`, and a `custom` profile set from the window
 - Values are read from the CPU itself; every write is read back and verified,
   and turbo stays off if anything fails
+- Installs made with `install.sh` update themselves from signed releases
 
 On an i7-5700HQ laptop, the `cool` profile keeps an 8-thread AVX load at 85 °C
-(stock: 95-100 °C) while single-threaded bursts still reach 3.5 GHz.
+(stock: 95-100 °C) while single-threaded bursts still reach 3.5 GHz. On a Ryzen 7 H 255,
+it keeps a 16-thread compile at 69 °C (stock: 90 °C) at 3.4 GHz, with 4.9 GHz bursts.
 
 ## Supported hardware
 
-Intel Core 4th to 10th generation, up to 8 cores, on Linux with systemd:
+Linux with systemd, and:
 
-| Generation | Status |
-|---|---|
-| Broadwell (5th gen) | tested (i7-5700HQ) |
-| Haswell, Skylake, Kaby Lake, Coffee Lake, Whiskey Lake, Comet Lake | expected to work, **untested** |
-| Ice Lake and later, AMD | not supported |
+| CPU | Settings | Status |
+|---|---|---|
+| Intel Broadwell (5th gen) | turbo ratios, PL1, throttle temperature, undervolt | tested (i7-5700HQ) |
+| Intel Haswell, Skylake, Kaby Lake, Coffee Lake, Whiskey Lake, Comet Lake | same | expected to work, **untested** |
+| AMD Ryzen 7040/8040 and 200 series (Phoenix, Hawk Point) | max frequency, sustained power, throttle temperature | tested (Ryzen 7 H 255) |
+| AMD Ryzen 6000 and 7035 (Rembrandt) | same | expected to work, **untested** |
+| Other AMD Ryzen (amd-pstate or acpi-cpufreq) | turbo and max frequency only | expected to work, **untested** |
+| Intel Ice Lake and later | | not supported |
 
 turboctl refuses to run on other CPUs. Each feature is used only if the CPU allows it:
 turbo ratios and throttle temperature can be locked by the CPU (shown as `locked`), and
 undervolting is locked by firmware or microcode on many CPUs since 2020 (Plundervolt).
+AMD CPUs cannot be undervolted with turboctl. The AMD power and temperature limits need
+the kernel parameter `iomem=relaxed` (see [Troubleshooting](#troubleshooting)).
 If you try an untested generation, please open an issue with the output of
 `sudo turboctl status`.
 
@@ -53,7 +60,17 @@ sudo ./install.sh stock    # or another profile
 ```
 
 Packagers: `make install DESTDIR=... PREFIX=/usr` copies the files without enabling
-anything. See the variables at the top of `install.sh`.
+anything, and such installs never update themselves. See the variables at the top of
+`install.sh`.
+
+### Updates
+
+`install.sh` enables `turboctl-update.timer`: once a day, `turboctl update` looks for a newer
+release on GitHub. It installs it only if the archive is signed with the release key (the
+public key is `data/allowed_signers`; the private key is not on GitHub), if it contains the
+announced version, and if its tests pass on the machine. The saved profile is kept and the
+window restarts in the new version. To install new releases by hand instead, install with
+`sudo AUTO_UPDATE=0 ./install.sh`, and run `sudo turboctl update` when you want.
 
 ### Tray icon
 
@@ -67,7 +84,7 @@ Left click opens the window, right click opens the menu (live readings and profi
 ### Language
 
 The window follows the system language (English or French). To choose another one, use the
-*Language* menu at the bottom of the window; the window restarts in that language.
+*Language* menu at the bottom of the window; the window and the tray menu switch at once.
 
 ### Password
 
@@ -88,6 +105,17 @@ Values derived from each CPU's factory limits (example: i7-5700HQ):
 | `stock` | on | factory (3.5 GHz) | factory (47 W) | factory (103 °C) |
 | `custom` | set in the window | | | |
 
+On AMD (example: Ryzen 7 H 255, factory 40 W average / 42 W sustained, 100 °C):
+
+| Profile | Turbo | Max frequency | Sustained power | Throttle at |
+|---|---|---|---|---|
+| `off` | off | base | factory (42 W) | factory (100 °C) |
+| `cool` | on | factory (4.9 GHz) | 65 % of factory (27 W) | 85 °C |
+| `stock` | on | factory (4.9 GHz) | factory (42 W) | factory (100 °C) |
+
+The short boost limit (65 W on the H 255) is left as is: it keeps the system responsive
+without heating it for long.
+
 ## Usage
 
 ```sh
@@ -95,12 +123,13 @@ sudo turboctl status         # CPU, limits in place, undervolt
 sudo turboctl monitor        # temperature, watts, ratio, active limit, once a second
 sudo turboctl set cool       # apply and save a profile
 sudo turboctl apply          # apply the saved profile again
+sudo turboctl update         # install the latest signed release, if newer
 turboctl-gui                 # the window (no sudo)
 ```
 
 ## Undervolt
 
-One offset from 0 to −100 mV for the cores and cache, applied with every profile:
+Intel only. One offset from 0 to −100 mV for the cores and cache, applied with every profile:
 
 ```sh
 sudo turboctl undervolt -50  # or the Undervolt slider and its Apply button
@@ -137,6 +166,20 @@ use the value for a few days (idle, video, sleep and resume) and watch
 | Undervolt | MSR `0x150`, planes 0 (cores) and 2 (cache) |
 | Turbo on/off | `intel_pstate/no_turbo` or `cpufreq/boost`, and bit 38 of MSR `0x1A0` |
 
+On AMD:
+
+| Setting | Where |
+|---|---|
+| Max frequency | `cpufreq` `scaling_max_freq` of every core |
+| Sustained power (STAPM and slow PPT), throttle temperature | SMU firmware mailbox, through the SMN registers of the PCI root (as RyzenAdj) |
+| Limits in place | SMU PM table, read through `/dev/mem` |
+| Turbo on/off | `cpufreq/boost` |
+
+The firmware puts its own power limits back when the power profile changes (balanced,
+performance, power saver) or when the charger is plugged in or out. `turboctl-watch.service`
+checks every 3 seconds and lowers them again; lower limits set by the firmware, as in power
+saver mode on battery, are left in place.
+
 The CPU forgets these settings at every boot and on resume, so `turboctl.service` writes
 them again. Factory values are captured before the first write of each boot
 (`/run/turboctl/factory.json`).
@@ -155,8 +198,8 @@ Normal: the kernel flags every MSR write from user space and taints itself (`S` 
 **`the kernel refused an MSR write`.** The kernel blocks MSR writes: kernel lockdown is
 active (often with Secure Boot), or `msr.allow_writes=off` is set.
 
-**`the kernel refused to map MCHBAR`** or **`/dev/mem access refused`**. The kernel is built
-with `CONFIG_IO_STRICT_DEVMEM`. Add the kernel parameter `iomem=relaxed`. On Solus:
+**`the kernel refused to map MCHBAR`**, **`the kernel refused to map the SMU table`** or
+**`/dev/mem access refused`**. The kernel is built with `CONFIG_IO_STRICT_DEVMEM`. Add the kernel parameter `iomem=relaxed`. On Solus:
 `echo iomem=relaxed | sudo tee /etc/kernel/cmdline.d/90-turboctl.conf && sudo clr-boot-manager update`.
 
 **`the firmware or microcode locks undervolting`.** This CPU cannot be undervolted;

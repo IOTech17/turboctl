@@ -44,25 +44,44 @@ def save_language(language):
         json.dump({"language": language}, file)
 
 
-if saved_language():
-    os.environ["LANGUAGE"] = saved_language()  # read by gettext, here and in GTK
 try:
     locale.setlocale(locale.LC_ALL, "")
 except locale.Error:
     pass
-_ = gettext.translation("turboctl", LOCALEDIR, fallback=True).gettext
+translation = gettext.NullTranslations()
+
+
+def set_language(language):
+    """Translate from now on into language, or into the system language for ""."""
+    global translation
+    languages = [language] if language else None  # None: LANGUAGE, LC_ALL, LC_MESSAGES, LANG
+    translation = gettext.translation("turboctl", LOCALEDIR, languages=languages, fallback=True)
+
+
+def _(text):
+    return translation.gettext(text)
+
+
+def N_(text):
+    """Mark text for translation; it is translated where it is shown."""
+    return text
+
+
+set_language(saved_language())
 
 # Without --disable-internal-agent, pkexec started from a terminal asks for the
 # password on the tty and reads it from our stdin pipe, so authentication fails.
 HELPER = ["pkexec", "--disable-internal-agent", SBINDIR + "/turboctl", "serve"]
 TRAY_WAIT_SECONDS = 60  # at login the panel may start after us
+UPDATE_CHECK_SECONDS = 5  # "turboctl update" replaces this file; the window then restarts itself
 
-PROFILE_LABELS = {"off": _("Turbo off"), "cool": _("Cool"), "stock": _("Stock"), "custom": _("Custom")}
+PROFILE_LABELS = {"off": N_("Turbo off"), "cool": N_("Cool"), "stock": N_("Stock"), "custom": N_("Custom")}
 LIMIT_LABELS = {
-    "MAX_TURBO": _("frequency ceiling"),
-    "PL1": _("power (PL1)"),
-    "PL2": _("power (PL2)"),
-    "THERMAL": _("temperature"),
+    "MAX_TURBO": N_("frequency ceiling"),
+    "PL1": N_("power (PL1)"),
+    "PL2": N_("power (PL2)"),
+    "POWER": N_("power"),
+    "THERMAL": N_("temperature"),
     "PROCHOT": "PROCHOT",
 }
 
@@ -71,12 +90,28 @@ def number(value):
     return locale.format_string("%.1f", value)
 
 
-def ghz(ratio):
-    return number(ratio / 10) + " GHz"
+def ghz(mhz):
+    return number(mhz / 1000) + " GHz"
 
 
 def watts(value):
     return number(value) + " W"
+
+
+# Settings other than turbo, per-core ratios and undervolt: caption, value format, slider step.
+FIELDS = {
+    "pl1": (N_("Max power (PL1)"), lambda v: f"{v:.0f} W", 1),
+    "tcc": (N_("Throttle at"), lambda v: f"{v:.0f} °C", 1),
+    "max_freq": (N_("Max frequency"), ghz, 100),
+    "power": (N_("Sustained power"), lambda v: f"{v:.0f} W", 1),
+    "temp": (N_("Throttle at"), lambda v: f"{v:.0f} °C", 1),
+}
+NOTES = {
+    "smu_unsupported": N_("Power and temperature limits are not supported on this CPU: turbo and frequency only."),
+    "smu_unavailable": N_(
+        "Power and temperature limits are unavailable: run “sudo turboctl status” for the reason."
+    ),
+}
 
 
 def big(text, color=None):
@@ -287,6 +322,11 @@ class StatusNotifierItem:
     def on_watcher_vanished(self, _connection, _name):
         self.registered = False
 
+    def set_title(self, text):
+        if text != self.title:
+            self.title = text
+            self.connection.emit_signal(None, self.PATH, self.INTERFACE, "NewTitle", None)
+
     def set_tooltip(self, text):
         if text != self.tooltip:
             self.tooltip = text
@@ -320,16 +360,17 @@ class Tray:
     def __init__(self, panel):
         self.sni = StatusNotifierItem(_("Turbo Boost"), panel.present_window)
         menu = self.menu = self.sni.menu
+        self.reading = None
         self.reading_item = menu.add({"label": _("Connecting…"), "enabled": False})
         menu.add({"type": "separator"})
-        menu.add({"label": _("Open Turbo Boost")}, panel.present_window)
+        self.open_item = menu.add({"label": _("Open Turbo Boost")}, panel.present_window)
         menu.add({"type": "separator"})
         self.profile_items = {
-            name: menu.add({"label": label, "toggle-type": "radio", "toggle-state": 0}, self.chooser(panel, name))
+            name: menu.add({"label": _(label), "toggle-type": "radio", "toggle-state": 0}, self.chooser(panel, name))
             for name, label in PROFILE_LABELS.items()
         }
         menu.add({"type": "separator"})
-        menu.add({"label": _("Quit")}, panel.quit)
+        self.quit_item = menu.add({"label": _("Quit")}, panel.quit)
 
     @staticmethod
     def chooser(panel, name):
@@ -339,10 +380,19 @@ class Tray:
     def available(self):
         return self.sni.registered
 
+    def retranslate(self):
+        self.sni.set_title(_("Turbo Boost"))
+        if self.reading is None:
+            self.menu.update(self.reading_item, label=_("Connecting…"))
+        self.menu.update(self.open_item, label=_("Open Turbo Boost"))
+        for name, item in self.profile_items.items():
+            self.menu.update(item, label=_(PROFILE_LABELS[name]))
+        self.menu.update(self.quit_item, label=_("Quit"))
+
     def update(self, state):
-        reading = f"{state['temp']} °C · {watts(state['watts'])} · {ghz(max(state['freqs']))}"
-        self.menu.update(self.reading_item, label=reading)
-        self.sni.set_tooltip(reading)
+        self.reading = f"{state['temp']} °C · {watts(state['watts'])} · {ghz(max(state['freqs']))}"
+        self.menu.update(self.reading_item, label=self.reading)
+        self.sni.set_tooltip(self.reading)
         for name, item in self.profile_items.items():
             props = {"toggle-state": int(state["profile"] == name), "enabled": name in state["profiles"]}
             self.menu.update(item, **props)
@@ -353,7 +403,7 @@ class Tray:
 
 class Panel(Gtk.ApplicationWindow):
     def __init__(self, app):
-        super().__init__(application=app, title=_("Turbo Boost"))
+        super().__init__(application=app)
         self.app = app
         self.set_icon_name("turboctl")
         self.set_default_size(520, -1)
@@ -362,8 +412,14 @@ class Panel(Gtk.ApplicationWindow):
         self.loading = False
         self.dirty = False
         self.uv_dirty = False
-        self.received_state = False
+        self.state = None
         self.controls_built = False
+        self.ratio_scales = []
+        self.scales = {}
+        self.uv_scale = None
+        # Functions that set a text in the current language, run again when it changes.
+        self.texts = []
+        self.translated(lambda: self.set_title(_("Turbo Boost")))
 
         self.box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         self.add(self.box)
@@ -379,19 +435,24 @@ class Panel(Gtk.ApplicationWindow):
         )
         threading.Thread(target=self.read_helper, daemon=True).start()
 
-    def build_readings(self):
-        grid = Gtk.Grid(column_spacing=12, column_homogeneous=True)
-        self.temp_value = self.add_reading(grid, 0, _("Temperature"))
-        self.watts_value = self.add_reading(grid, 1, _("Power"))
-        self.freq_value = self.add_reading(grid, 2, _("Frequency"))
-        self.box.add(grid)
-        self.cores_label = Gtk.Label(xalign=0, wrap=True)
-        self.limits_label = Gtk.Label(xalign=0)
-        self.box.add(self.cores_label)
-        self.box.add(self.limits_label)
+        # Set (and removed) by the copy of this window that restarted after an update.
+        self.updated = os.environ.pop("TURBOCTL_UPDATED", None) is not None
+        self.program = os.path.realpath(__file__)
+        self.program_mtime = self.seen_mtime = os.stat(self.program).st_mtime_ns
+        GLib.timeout_add_seconds(UPDATE_CHECK_SECONDS, self.check_update)
+
+    def translated(self, set_text):
+        self.texts.append(set_text)
+        set_text()
+
+    def caption(self, text, **props):
+        """A label showing text, a string marked with N_(), in the current language."""
+        label = Gtk.Label(xalign=0, **props)
+        self.translated(lambda: label.set_text(_(text)))
+        return label
 
     def build_language_row(self):
-        combo = Gtk.ComboBoxText()
+        self.language_combo = combo = Gtk.ComboBoxText()
         combo.append("", _("System default"))
         for code, name in LANGUAGES.items():
             combo.append(code, name)
@@ -399,20 +460,46 @@ class Panel(Gtk.ApplicationWindow):
         combo.connect("changed", self.on_language_changed)
         row = Gtk.Box(spacing=6)
         row.pack_end(combo, False, False, 0)
-        row.pack_end(Gtk.Label(label=_("Language")), False, False, 0)
+        row.pack_end(self.caption(N_("Language")), False, False, 0)
         return row
 
     def on_language_changed(self, combo):
-        # The labels are built once, so the window restarts in the new language.
-        save_language(combo.get_active_id())
-        self.app.restart = True
-        self.quit()
+        language = combo.get_active_id()
+        if language is None:
+            return
+        save_language(language)
+        set_language(language)
+        # "System default" is the only entry written in the interface language.
+        combo.handler_block_by_func(self.on_language_changed)
+        combo.remove(0)
+        combo.prepend("", _("System default"))
+        combo.set_active_id(language)
+        combo.handler_unblock_by_func(self.on_language_changed)
+        for set_text in self.texts:
+            set_text()
+        self.tray.retranslate()
+        if self.state:
+            self.show_state(self.state)
+        if self.dirty:
+            self.status_label.set_text(_("Changes not applied"))
 
-    @staticmethod
-    def add_reading(grid, column, caption):
+    def build_readings(self):
+        grid = Gtk.Grid(column_spacing=12, column_homogeneous=True)
+        self.temp_value = self.add_reading(grid, 0, N_("Temperature"))
+        self.watts_value = self.add_reading(grid, 1, N_("Power"))
+        self.freq_value = self.add_reading(grid, 2, N_("Frequency"))
+        self.box.add(grid)
+        self.cores_label = Gtk.Label(xalign=0, wrap=True)
+        self.limits_label = Gtk.Label(xalign=0)
+        self.box.add(self.cores_label)
+        self.box.add(self.limits_label)
+
+    def add_reading(self, grid, column, caption):
         value = Gtk.Label(label="–")
         grid.attach(value, column, 0, 1, 1)
-        grid.attach(Gtk.Label(label=caption), column, 1, 1, 1)
+        label = self.caption(caption)
+        label.set_xalign(0.5)
+        grid.attach(label, column, 1, 1, 1)
         return value
 
     def build_controls(self, state):
@@ -421,70 +508,78 @@ class Panel(Gtk.ApplicationWindow):
         self.radios = {}
         group = None
         for name, label in PROFILE_LABELS.items():
-            radio = Gtk.RadioButton.new_with_label_from_widget(group, label)
+            radio = Gtk.RadioButton.new_from_widget(group)
+            self.translated(lambda radio=radio, label=label: radio.set_label(_(label)))
             group = group or radio
             radio.connect("toggled", self.on_profile_toggled, name)
             self.radios[name] = radio
             row.add(radio)
         self.box.add(row)
 
-        bounds = state["bounds"]
+        bounds, writable = state["bounds"], state["writable"]
         grid = Gtk.Grid(column_spacing=12, row_spacing=6)
         self.turbo_switch = Gtk.Switch(halign=Gtk.Align.START)
         self.turbo_switch.connect("notify::active", self.on_turbo_switched)
-        grid.attach(Gtk.Label(label=_("Turbo"), xalign=0), 0, 0, 1, 1)
+        grid.attach(self.caption(N_("Turbo")), 0, 0, 1, 1)
         grid.attach(self.turbo_switch, 1, 0, 1, 1)
 
-        self.ratio_scales = []
-        for index in range(state["cpu"]["cores"]):
-            scale = self.make_scale(*bounds["ratio"], ghz)
-            scale.connect("value-changed", self.on_ratio_changed, index)
-            self.ratio_scales.append(scale)
-            caption = _("1 active core") if index == 0 else _("{} active cores").format(index + 1)
-            grid.attach(Gtk.Label(label=caption, xalign=0), 0, index + 1, 1, 1)
-            grid.attach(scale, 1, index + 1, 1, 1)
-
-        row = state["cpu"]["cores"] + 1
-        self.pl1_scale = self.make_scale(*bounds["pl1"], lambda v: f"{v:.0f} W")
-        self.tcc_scale = self.make_scale(*bounds["tcc"], lambda v: f"{v:.0f} °C")
-        for caption, scale in ((_("Max power (PL1)"), self.pl1_scale), (_("Throttle at"), self.tcc_scale)):
+        line = 1
+        for key in state["fields"]:
+            if key == "ratios":
+                for index in range(state["cpu"]["cores"]):
+                    scale = self.make_scale(*bounds["ratio"], lambda v: ghz(v * 100))
+                    scale.connect("value-changed", self.on_ratio_changed, index)
+                    self.ratio_scales.append(scale)
+                    caption = Gtk.Label(xalign=0)
+                    self.translated(
+                        lambda caption=caption, count=index + 1: caption.set_text(
+                            _("1 active core") if count == 1 else _("{} active cores").format(count)
+                        )
+                    )
+                    grid.attach(caption, 0, line, 1, 1)
+                    grid.attach(scale, 1, line, 1, 1)
+                    line += 1
+                continue
+            text, formatter, step = FIELDS[key]
+            scale = self.make_scale(*bounds[key], formatter, step)
             scale.connect("value-changed", self.on_setting_changed)
-            grid.attach(Gtk.Label(label=caption, xalign=0), 0, row, 1, 1)
-            grid.attach(scale, 1, row, 1, 1)
-            row += 1
+            scale.set_sensitive(writable[key])
+            self.scales[key] = scale
+            grid.attach(self.caption(text), 0, line, 1, 1)
+            grid.attach(scale, 1, line, 1, 1)
+            line += 1
 
-        # Independent of the profiles: applied on its own, then with every profile.
-        self.uv_scale = self.make_scale(*bounds["undervolt"], lambda v: f"{v:.0f} mV")
-        self.uv_scale.get_adjustment().set_step_increment(5)
-        self.uv_scale.connect("value-changed", self.on_uv_changed)
-        self.uv_button = Gtk.Button(label=_("Apply"), sensitive=False)
-        self.uv_button.connect("clicked", lambda _button: self.send_undervolt())
-        grid.attach(Gtk.Label(label=_("Undervolt"), xalign=0), 0, row, 1, 1)
-        grid.attach(self.uv_scale, 1, row, 1, 1)
-        grid.attach(self.uv_button, 2, row, 1, 1)
-        self.uv_note = Gtk.Label(xalign=0, wrap=True, max_width_chars=50)
-        grid.attach(self.uv_note, 0, row + 1, 3, 1)
+        if "undervolt" in bounds:
+            # Independent of the profiles: applied on its own, then with every profile.
+            self.uv_scale = self.make_scale(*bounds["undervolt"], lambda v: f"{v:.0f} mV", 5)
+            self.uv_scale.connect("value-changed", self.on_uv_changed)
+            self.uv_button = Gtk.Button(sensitive=False)
+            self.translated(lambda: self.uv_button.set_label(_("Apply")))
+            self.uv_button.connect("clicked", lambda _button: self.send_undervolt())
+            grid.attach(self.caption(N_("Undervolt")), 0, line, 1, 1)
+            grid.attach(self.uv_scale, 1, line, 1, 1)
+            grid.attach(self.uv_button, 2, line, 1, 1)
+            self.uv_note = Gtk.Label(xalign=0, wrap=True, max_width_chars=50)
+            grid.attach(self.uv_note, 0, line + 1, 3, 1)
         self.box.add(grid)
 
         footer = Gtk.Box(spacing=12)
         self.status_label = Gtk.Label(xalign=0, wrap=True, max_width_chars=40)
-        self.apply_button = Gtk.Button(label=_("Apply"))
+        self.apply_button = Gtk.Button()
+        self.translated(lambda: self.apply_button.set_label(_("Apply")))
         self.apply_button.get_style_context().add_class("suggested-action")
         self.apply_button.connect("clicked", lambda _button: self.send_custom())
         footer.pack_start(self.status_label, True, True, 0)
         footer.pack_end(self.apply_button, False, False, 0)
         self.box.add(footer)
 
-        writable = state["writable"]
-        self.ratios_writable = writable["ratios"]
-        self.tcc_scale.set_sensitive(writable["tcc"])
-        self.pl1_scale.set_sensitive(state["pl1"] is not None)
+        self.ratios_writable = writable.get("ratios", False)
         self.controls_built = True
         self.box.show_all()
 
     @staticmethod
-    def make_scale(low, high, formatter):
-        scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, low, high, 1)
+    def make_scale(low, high, formatter, step=1):
+        scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, low, high, step)
         scale.set_hexpand(True)
         scale.set_digits(0)
         scale.set_value_pos(Gtk.PositionType.RIGHT)
@@ -501,6 +596,27 @@ class Panel(Gtk.ApplicationWindow):
             return True
         self.quit()
         return False
+
+    def check_update(self):
+        try:
+            mtime = os.stat(self.program).st_mtime_ns
+        except OSError:
+            return GLib.SOURCE_CONTINUE  # being replaced
+        # Restart once the new file has stayed the same for one check, and no edit is pending.
+        if mtime != self.program_mtime and mtime == self.seen_mtime and not self.dirty:
+            self.restart()
+        self.seen_mtime = mtime
+        return GLib.SOURCE_CONTINUE
+
+    def restart(self):
+        try:
+            self.helper.stdin.close()
+            self.helper.wait(timeout=5)  # else it stays a zombie of the new process
+        except (BrokenPipeError, subprocess.TimeoutExpired):
+            pass
+        os.environ["TURBOCTL_UPDATED"] = "1"
+        arguments = [] if self.get_visible() else ["--tray"]
+        os.execv(sys.executable, [sys.executable, self.program, *arguments])
 
     def quit(self):
         # Closing stdin makes the root helper exit.
@@ -528,16 +644,12 @@ class Panel(Gtk.ApplicationWindow):
 
     def send_custom(self):
         self.dirty = False
-        self.send(
-            {
-                "custom": {
-                    "turbo": self.turbo_switch.get_active(),
-                    "ratios": [int(scale.get_value()) for scale in self.ratio_scales],
-                    "pl1": int(self.pl1_scale.get_value()),
-                    "tcc": int(self.tcc_scale.get_value()),
-                }
-            }
-        )
+        custom = {"turbo": self.turbo_switch.get_active()}
+        if self.ratio_scales:
+            custom["ratios"] = [int(scale.get_value()) for scale in self.ratio_scales]
+        for key, scale in self.scales.items():
+            custom[key] = int(scale.get_value())
+        self.send({"custom": custom})
 
     def send_undervolt(self):
         self.uv_dirty = False
@@ -593,23 +705,41 @@ class Panel(Gtk.ApplicationWindow):
         self.loading = True
         self.radios[state["profile"]].set_active(True)
         self.turbo_switch.set_active(state["turbo"])
-        for scale, ratio in zip(self.ratio_scales, state["ratios"]):
+        values = state["values"]
+        for scale, ratio in zip(self.ratio_scales, values.get("ratios", [])):
             scale.set_value(ratio)
-        if state["pl1"] is not None:
-            self.pl1_scale.set_value(state["pl1"])
-        self.tcc_scale.set_value(state["tcc"])
+        for key, scale in self.scales.items():
+            if values.get(key) is not None:
+                scale.set_value(values[key])
         self.loading = False
         self.update_sensitivity()
 
     def on_state(self, state):
-        self.received_state = True
+        self.state = state
         if not self.controls_built:
             self.build_controls(state)
-            cpu = state["cpu"]
-            text = f"{cpu['name']} · {cpu['generation']}"
-            if not cpu["tested"]:
-                text += "\n" + _("This CPU generation is untested: check the readings before relying on it.")
-            self.cpu_label.set_text(text)
+        self.show_state(state)
+        self.tray.update(state)
+
+        if self.uv_scale and not self.uv_dirty:
+            self.loading = True
+            self.uv_scale.set_value(state["undervolt"])
+            self.loading = False
+        if not self.dirty:
+            self.load_controls(state)
+        return GLib.SOURCE_REMOVE
+
+    def show_state(self, state):
+        """Write the texts that depend on the state, in the current language."""
+        cpu = state["cpu"]
+        text = f"{cpu['name']} · {cpu['generation']}"
+        if not cpu["tested"]:
+            text += "\n" + _("This CPU generation is untested: check the readings before relying on it.")
+        for note in state.get("notes", []):
+            text += "\n" + _(NOTES.get(note, note))
+        if self.updated:
+            text += "\n" + _("Updated to turboctl {}.").format(state["version"])
+        self.cpu_label.set_text(text)
 
         temp = state["temp"]
         color = "#d0342c" if temp >= 90 else "#e08a00" if temp >= 85 else None
@@ -617,27 +747,19 @@ class Panel(Gtk.ApplicationWindow):
         self.watts_value.set_markup(big(watts(state["watts"])))
         self.freq_value.set_markup(big(ghz(max(state["freqs"]))))
         self.cores_label.set_text(_("Cores: ") + " / ".join(ghz(freq) for freq in state["freqs"]))
-        limits = ", ".join(LIMIT_LABELS.get(name, name) for name in state["limits"]) or _("none")
+        limits = ", ".join(_(LIMIT_LABELS.get(name, name)) for name in state["limits"]) or _("none")
         self.limits_label.set_text(_("Active limit: ") + limits)
-        self.tray.update(state)
-
-        if not self.uv_dirty:
-            self.loading = True
-            self.uv_scale.set_value(state["undervolt"])
-            self.loading = False
-        crash = state["undervolt_crash"]
-        self.uv_note.set_text(
-            _("Unclean shutdown with {} mV: undervolt reset to 0 mV for safety.").format(crash) if crash else ""
-        )
-
+        if self.uv_scale:
+            crash = state["undervolt_crash"]
+            self.uv_note.set_text(
+                _("Unclean shutdown with {} mV: undervolt reset to 0 mV for safety.").format(crash) if crash else ""
+            )
         if not self.dirty:
-            self.load_controls(state)
-            label = PROFILE_LABELS[state["profile"]]
+            label = _(PROFILE_LABELS[state["profile"]])
             self.status_label.set_text(state["error"] or _("Active profile: ") + label)
-        return GLib.SOURCE_REMOVE
 
     def on_helper_exit(self):
-        if self.received_state:
+        if self.state:
             message = _("The control service stopped.")
         else:
             message = _("Authorization refused or CPU not supported. Run “sudo turboctl status” for details.")
@@ -655,7 +777,6 @@ class App(Gtk.Application):
     def __init__(self):
         super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
         self.panel = None
-        self.restart = False
 
     def do_command_line(self, command_line):
         tray_only = "--tray" in command_line.get_arguments()[1:]
@@ -676,14 +797,7 @@ class App(Gtk.Application):
 
 
 def main():
-    app = App()
-    status = app.run(sys.argv)
-    if app.restart:
-        # Release the application and tray names before the new process asks for them.
-        app.get_dbus_connection().close_sync(None)
-        script = os.path.abspath(sys.argv[0])
-        os.execv(sys.executable, [sys.executable, script])  # without --tray: show the window
-    sys.exit(status)
+    sys.exit(App().run(sys.argv))
 
 
 if __name__ == "__main__":

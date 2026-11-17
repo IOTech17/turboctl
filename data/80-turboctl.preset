@@ -1,0 +1,5 @@
+# Keep the turboctl services enabled when the distribution resets services to
+# its presets (Solus does after some updates, with a final "disable *").
+enable turboctl.service
+enable turboctl-shutdown.service
+enable turboctl-watch.service
