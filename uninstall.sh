@@ -59,7 +59,9 @@ rm -f "$DESTDIR$SBINDIR/turboctl" \
 rmdir "$DESTDIR$DATADIR/turboctl" 2>/dev/null || true
 [ "$files_only" = 1 ] && exit 0
 
-rm -f /var/lib/turboctl/install.env "$SYSCONFDIR/systemd/system-preset/80-turboctl-update.preset"
+rm -f /var/lib/turboctl/install.env /var/lib/turboctl/update-interval \
+      "$SYSCONFDIR/systemd/system-preset/80-turboctl-update.preset"
+rm -rf "$SYSCONFDIR/systemd/system/turboctl-update.timer.d"
 [ "$purge" = 1 ] && rm -rf /var/lib/turboctl
 rm -rf /run/turboctl
 systemctl daemon-reload

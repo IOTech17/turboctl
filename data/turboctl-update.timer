@@ -1,7 +1,10 @@
 [Unit]
-Description=Check for a new turboctl release every day
+Description=Check for a new turboctl release at boot and at the chosen interval
 
 [Timer]
+# 5 minutes after boot, once the network is usually up: a laptop that was off at the
+# chosen time still finds the release. Persistent also catches a missed run at boot.
+OnBootSec=5min
 OnCalendar=daily
 RandomizedDelaySec=1h
 Persistent=true

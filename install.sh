@@ -105,17 +105,12 @@ LOCALEDIR=$LOCALEDIR
 UNITDIR=$UNITDIR
 PRESETDIR=$PRESETDIR
 NOPASSWD=$NOPASSWD
-AUTO_UPDATE=$AUTO_UPDATE
 EOF
-update_preset="$SYSCONFDIR/systemd/system-preset/80-turboctl-update.preset"
+# Sets up turboctl-update.timer, keeping the interval chosen in the window.
 if [ "$AUTO_UPDATE" = 1 ]; then
-    # In /etc, as the timer is enabled only for this way of installing.
-    install -d "$(dirname "$update_preset")"
-    echo "enable turboctl-update.timer" > "$update_preset"
-    systemctl enable --now turboctl-update.timer
+    "$SBINDIR/turboctl" update-interval
 else
-    rm -f "$update_preset"
-    systemctl disable --now turboctl-update.timer 2>/dev/null || true
+    "$SBINDIR/turboctl" update-interval never
 fi
 if [ "$update" = 1 ]; then
     echo "turboctl updated."

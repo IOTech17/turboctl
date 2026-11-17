@@ -65,12 +65,14 @@ anything, and such installs never update themselves. See the variables at the to
 
 ### Updates
 
-`install.sh` enables `turboctl-update.timer`: once a day, `turboctl update` looks for a newer
-release on GitHub. It installs it only if the archive is signed with the release key (the
+`install.sh` enables `turboctl-update.timer`: 5 minutes after each boot and once a day,
+`turboctl update` looks for a newer release on GitHub. The interval is set in the window
+(every 12 hours, daily, weekly, monthly or never) or with `sudo turboctl update-interval 12h`. It installs it only if the archive is signed with the release key (the
 public key is `data/allowed_signers`; the private key is not on GitHub), if it contains the
 announced version, and if its tests pass on the machine. The saved profile is kept and the
 window restarts in the new version. To install new releases by hand instead, install with
-`sudo AUTO_UPDATE=0 ./install.sh`, and run `sudo turboctl update` when you want.
+*Never* in the window or `sudo AUTO_UPDATE=0 ./install.sh`, and run `sudo turboctl update`
+when you want.
 
 ### Tray icon
 

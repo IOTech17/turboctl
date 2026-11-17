@@ -301,5 +301,58 @@ class Update(unittest.TestCase):
         self.assertEqual(self.installs, [])
 
 
+class UpdateInterval(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        self.paths = {
+            "STATE_DIR": tmp,
+            "INSTALL_FILE": tmp + "/install.env",
+            "UPDATE_INTERVAL_FILE": tmp + "/update-interval",
+            "UPDATE_TIMER_DROPIN": tmp + "/timer.d/interval.conf",
+            "UPDATE_PRESET": tmp + "/preset/80-turboctl-update.preset",
+        }
+        with open(self.paths["INSTALL_FILE"], "w") as f:
+            f.write("PREFIX=/usr\n")
+        self.calls = []
+        run = lambda args, **kwargs: self.calls.append(args[2:])  # noqa: E731
+        patchers = (mock.patch.multiple(turboctl, **self.paths), mock.patch.object(turboctl.subprocess, "run", run))
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def read(self, key):
+        with open(self.paths[key]) as f:
+            return f.read()
+
+    def test_weekly_12h_then_never(self):
+        self.assertEqual(turboctl.saved_update_interval(), "daily")
+        turboctl.set_update_interval("weekly")
+        self.assertEqual(turboctl.saved_update_interval(), "weekly")
+        self.assertIn("OnCalendar=weekly", self.read("UPDATE_TIMER_DROPIN"))
+        self.assertEqual(self.read("UPDATE_PRESET"), "enable turboctl-update.timer\n")
+        self.assertEqual(self.calls[-1], ["restart", "turboctl-update.timer"])
+
+        turboctl.set_update_interval("12h")
+        self.assertIn("OnCalendar=*-*-* 00,12:00:00", self.read("UPDATE_TIMER_DROPIN"))
+
+        turboctl.set_update_interval("never")
+        self.assertFalse(os.path.exists(self.paths["UPDATE_TIMER_DROPIN"]))
+        self.assertEqual(self.read("UPDATE_PRESET"), "disable turboctl-update.timer\n")
+        self.assertEqual(self.calls[-1], ["disable", "--now", "turboctl-update.timer"])
+
+    def test_package_installs_have_no_interval(self):
+        os.remove(self.paths["INSTALL_FILE"])
+        self.assertIsNone(turboctl.saved_update_interval())
+        with self.assertRaises(turboctl.Unsupported):
+            turboctl.set_update_interval("weekly")
+
+    def test_request_from_the_window(self):
+        self.assertEqual(turboctl.handle_request(None, None, '{"update_interval": "yearly"}'),
+                         "unknown update interval")
+        self.assertIsNone(turboctl.handle_request(None, None, '{"update_interval": "monthly"}'))
+        self.assertEqual(turboctl.saved_update_interval(), "monthly")
+
+
 if __name__ == "__main__":
     unittest.main()

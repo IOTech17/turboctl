@@ -12,6 +12,7 @@ Usage:
   turboctl serve                  JSON backend used by turboctl-gui
   turboctl watch                  keep the AMD power limits when the firmware raises them (service)
   turboctl update                 install the latest signed release, if newer (install.sh installs)
+  turboctl update-interval [WHEN] check at boot and every 12h, daily, weekly, monthly, or never (default: as saved)
   turboctl clean-shutdown         run at shutdown by turboctl-shutdown.service
   turboctl --version
 
@@ -36,7 +37,7 @@ import time
 import urllib.error
 import urllib.request
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 STATE_DIR = "/var/lib/turboctl"
 PROFILE_FILE = STATE_DIR + "/profile"
@@ -53,6 +54,14 @@ LATEST_RELEASE = "https://api.github.com/repos/IOTech17/turboctl/releases/latest
 # Public key of the releases; an update is installed only if its signature matches.
 ALLOWED_SIGNERS = "@DATADIR@/turboctl/allowed_signers"  # filled in by install.sh
 SIGNER = "turboctl-release"  # identity and namespace of the release signatures
+# How often turboctl-update.timer runs, chosen in the window: a systemd OnCalendar value, or None.
+UPDATE_INTERVALS = {
+    "12h": "*-*-* 00,12:00:00", "daily": "daily", "weekly": "weekly", "monthly": "monthly", "never": None,
+}
+UPDATE_INTERVAL_FILE = STATE_DIR + "/update-interval"
+UPDATE_TIMER = "turboctl-update.timer"
+UPDATE_TIMER_DROPIN = "/etc/systemd/system/turboctl-update.timer.d/interval.conf"
+UPDATE_PRESET = "/etc/systemd/system-preset/80-turboctl-update.preset"
 # Factory limits, captured before turboctl's first write of each boot.
 FACTORY_FILE = "/run/turboctl/factory.json"
 # Power and temperature limits written to the SMU this boot, kept by "watch".
@@ -1039,6 +1048,11 @@ def handle_request(cpu, factory, raw):
     """Apply and save one JSON request from the GUI; return an error message or None."""
     try:
         request = json.loads(raw)
+        if "update_interval" in request:
+            if request["update_interval"] not in UPDATE_INTERVALS:
+                return "unknown update interval"
+            set_update_interval(request["update_interval"])
+            return None
         if "undervolt" in request:
             if is_amd(cpu):
                 return "undervolting is not available on AMD CPUs"
@@ -1062,6 +1076,8 @@ def handle_request(cpu, factory, raw):
         save_profile(name)
     except (ValueError, KeyError, TypeError) as err:
         return f"invalid request: {err}"
+    except subprocess.CalledProcessError as err:
+        return f"systemctl failed ({err.returncode})"
     except (OSError, Unsupported) as err:
         return str(err)
     except SystemExit as err:
@@ -1106,6 +1122,7 @@ def serve(cpu):
             "notes": [cpu["smu_note"]] if is_amd(cpu) and cpu["smu_note"] else [],
             "undervolt": None if is_amd(cpu) else saved_undervolt(),
             "undervolt_crash": None if is_amd(cpu) else undervolt_crash(),
+            "update_interval": saved_update_interval(),
             "error": error,
         }
         try:
@@ -1134,6 +1151,41 @@ def read_install_settings():
     except FileNotFoundError:
         return None
     return dict(line.split("=", 1) for line in lines if "=" in line)
+
+
+def saved_update_interval():
+    """Return the interval chosen for updates, or None for an install made by a package."""
+    if read_install_settings() is None:
+        return None
+    try:
+        interval = read_text(UPDATE_INTERVAL_FILE)
+    except OSError:
+        return "daily"
+    return interval if interval in UPDATE_INTERVALS else "daily"
+
+
+def set_update_interval(interval):
+    """Save the interval and set up the timer for it (also run by install.sh)."""
+    if read_install_settings() is None:
+        raise Unsupported("automatic updates are only for installs made with install.sh")
+    calendar = UPDATE_INTERVALS[interval]
+    os.makedirs(STATE_DIR, exist_ok=True)
+    write_text(UPDATE_INTERVAL_FILE, interval + "\n")
+    if calendar:
+        os.makedirs(os.path.dirname(UPDATE_TIMER_DROPIN), exist_ok=True)
+        write_text(UPDATE_TIMER_DROPIN, f"[Timer]\nOnCalendar=\nOnCalendar={calendar}\n")
+    else:
+        remove(UPDATE_TIMER_DROPIN)
+    # The preset keeps the choice when the distribution resets services to their presets.
+    os.makedirs(os.path.dirname(UPDATE_PRESET), exist_ok=True)
+    write_text(UPDATE_PRESET, f"{'enable' if calendar else 'disable'} {UPDATE_TIMER}\n")
+    systemctl = ["systemctl", "--quiet"]
+    subprocess.run([*systemctl, "daemon-reload"], check=True)
+    if calendar:
+        subprocess.run([*systemctl, "enable", UPDATE_TIMER], check=True)
+        subprocess.run([*systemctl, "restart", UPDATE_TIMER], check=True)
+    else:
+        subprocess.run([*systemctl, "disable", "--now", UPDATE_TIMER], check=True)
 
 
 def update():
@@ -1272,7 +1324,8 @@ def main():
         print(f"turboctl {__version__}")
         return
     commands = (
-        "status", "monitor", "serve", "watch", "update", "apply", "set", "undervolt", "uvtest", "clean-shutdown",
+        "status", "monitor", "serve", "watch", "update", "update-interval", "apply", "set", "undervolt", "uvtest",
+        "clean-shutdown",
     )
     if command not in commands or len(args) > (3 if command == "uvtest" else 2):
         sys.exit(__doc__)
@@ -1286,6 +1339,16 @@ def main():
             update()
         except subprocess.CalledProcessError as err:
             sys.exit(f"turboctl: the new install.sh failed ({err.returncode})")
+        return
+    if command == "update-interval":
+        interval = args[1] if len(args) == 2 else saved_update_interval() or "daily"
+        if interval not in UPDATE_INTERVALS:
+            sys.exit(f"turboctl: WHEN must be one of {', '.join(UPDATE_INTERVALS)}")
+        try:
+            set_update_interval(interval)
+        except Unsupported as err:
+            sys.exit(f"turboctl: {err}")
+        print(f"updates: {interval}")
         return
 
     cpu = detect_cpu()

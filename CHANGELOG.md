@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.1
+
+- Updates are also checked 5 minutes after each boot, so a laptop that was off finds them
+- Update interval in the window: every 12 hours, daily, weekly, monthly or never
+  (`turboctl update-interval`); the choice is kept across updates and reinstalls
+
 ## 1.1.0
 
 - AMD Ryzen: turbo and max frequency on amd-pstate and acpi-cpufreq; sustained power

@@ -75,6 +75,13 @@ HELPER = ["pkexec", "--disable-internal-agent", SBINDIR + "/turboctl", "serve"]
 TRAY_WAIT_SECONDS = 60  # at login the panel may start after us
 UPDATE_CHECK_SECONDS = 5  # "turboctl update" replaces this file; the window then restarts itself
 
+UPDATE_LABELS = {
+    "12h": N_("At startup and every 12 hours"),
+    "daily": N_("At startup and daily"),
+    "weekly": N_("At startup and weekly"),
+    "monthly": N_("At startup and monthly"),
+    "never": N_("Never"),
+}
 PROFILE_LABELS = {"off": N_("Turbo off"), "cool": N_("Cool"), "stock": N_("Stock"), "custom": N_("Custom")}
 LIMIT_LABELS = {
     "MAX_TURBO": N_("frequency ceiling"),
@@ -463,6 +470,30 @@ class Panel(Gtk.ApplicationWindow):
         row.pack_end(self.caption(N_("Language")), False, False, 0)
         return row
 
+    def build_update_row(self):
+        self.update_combo = combo = Gtk.ComboBoxText()
+        combo.connect("changed", self.on_update_interval_changed)
+        self.translated(self.fill_update_combo)
+        row = Gtk.Box(spacing=6)
+        row.pack_end(combo, False, False, 0)
+        row.pack_end(self.caption(N_("Check for updates")), False, False, 0)
+        return row
+
+    def fill_update_combo(self):
+        """Write the entries in the current language, keeping the selection."""
+        combo = self.update_combo
+        combo.handler_block_by_func(self.on_update_interval_changed)
+        combo.remove_all()
+        for interval, label in UPDATE_LABELS.items():
+            combo.append(interval, _(label))
+        combo.set_active_id(self.state["update_interval"] if self.state else None)
+        combo.handler_unblock_by_func(self.on_update_interval_changed)
+
+    def on_update_interval_changed(self, combo):
+        interval = combo.get_active_id()
+        if interval:
+            self.send({"update_interval": interval})
+
     def on_language_changed(self, combo):
         language = combo.get_active_id()
         if language is None:
@@ -572,6 +603,9 @@ class Panel(Gtk.ApplicationWindow):
         footer.pack_start(self.status_label, True, True, 0)
         footer.pack_end(self.apply_button, False, False, 0)
         self.box.add(footer)
+
+        if state.get("update_interval"):  # absent for installs made by a package
+            self.box.pack_end(self.build_update_row(), False, False, 0)
 
         self.ratios_writable = writable.get("ratios", False)
         self.controls_built = True
@@ -718,6 +752,11 @@ class Panel(Gtk.ApplicationWindow):
         self.state = state
         if not self.controls_built:
             self.build_controls(state)
+        combo = getattr(self, "update_combo", None)
+        if combo and state["update_interval"] and combo.get_active_id() != state["update_interval"]:
+            combo.handler_block_by_func(self.on_update_interval_changed)
+            combo.set_active_id(state["update_interval"])
+            combo.handler_unblock_by_func(self.on_update_interval_changed)
         self.show_state(state)
         self.tray.update(state)
 
