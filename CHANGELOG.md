@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.0
+
+- Intel: PL2 and the PL1 time window can be set in the custom profile. With the factory
+  28 s window and 58 W PL2, the CPU can run well above its PL1 for several seconds and
+  overshoot the throttle temperature; lowering both keeps the power close to PL1.
+  The other profiles, and custom settings saved before, keep the factory values
+- The active limit shows every limit hit during the last second (read 10 times a second),
+  not only the one in force at the instant of the reading
+
 ## 1.1.1
 
 - Updates are also checked 5 minutes after each boot, so a laptop that was off finds them

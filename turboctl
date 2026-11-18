@@ -37,7 +37,7 @@ import time
 import urllib.error
 import urllib.request
 
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 
 STATE_DIR = "/var/lib/turboctl"
 PROFILE_FILE = STATE_DIR + "/profile"
@@ -104,6 +104,7 @@ MSR_PKG_POWER_LIMIT = 0x610
 MSR_PKG_ENERGY = 0x611
 LIMIT_REASON_MSRS = (0x64F, 0x690)  # Skylake and later, then Haswell/Broadwell
 LIMIT_REASON_BITS = {0: "PROCHOT", 1: "THERMAL", 10: "PL1", 11: "PL2", 12: "MAX_TURBO"}
+LIMIT_POLLS = 10  # reads of the limit reasons per second
 
 MCHBAR_PCI_CONFIG = "/sys/bus/pci/devices/0000:00:00.0/config"
 MCHBAR_PL_OFFSET = 0x59A0  # MMIO mirror of the package power limits
@@ -262,6 +263,7 @@ def detect_cpu():
         "ratio_writable": bool(platform >> 28 & 1),
         "tcc_writable": bool(platform >> 30 & 1),
         "power_unit": 1 << (rdmsr(MSR_RAPL_UNIT) & 0xF),  # steps per watt
+        "time_unit": 0.5 ** ((rdmsr(MSR_RAPL_UNIT) >> 16) & 0xF),  # seconds per step
     }
 
 
@@ -274,8 +276,37 @@ def get_tcc(cpu):
     return cpu["tjmax"] - ((rdmsr(MSR_TEMP_TARGET) >> 24) & 0x3F)
 
 
-def msr_pl1(cpu):
-    return (rdmsr(MSR_PKG_POWER_LIMIT) & 0x7FFF) / cpu["power_unit"]
+def window_seconds(bits, cpu):
+    """PL1 time window of a 7-bit field: 2^Y * (1 + Z/4) time units."""
+    return 2 ** (bits & 0x1F) * (1 + (bits >> 5 & 3) / 4) * cpu["time_unit"]
+
+
+def window_bits(seconds, cpu):
+    """The 7-bit field closest to seconds."""
+    return min(range(0x80), key=lambda bits: abs(window_seconds(bits, cpu) - seconds))
+
+
+def decode_power(value, cpu):
+    """PL1, PL2 and the PL1 time window (tau) of a package power limit register."""
+    return {
+        "pl1": (value & 0x7FFF) / cpu["power_unit"],
+        "pl2": (value >> 32 & 0x7FFF) / cpu["power_unit"],
+        "tau": window_seconds(value >> 17 & 0x7F, cpu),
+    }
+
+
+def encode_power(value, cpu, profile):
+    value &= ~(0x7FFF | 0x7F << 17 | 0x7FFF << 32)
+    return (
+        value
+        | round(profile["pl1"] * cpu["power_unit"])
+        | window_bits(profile["tau"], cpu) << 17
+        | round(profile["pl2"] * cpu["power_unit"]) << 32
+    )
+
+
+def msr_power(cpu):
+    return decode_power(rdmsr(MSR_PKG_POWER_LIMIT), cpu)
 
 
 def mchbar_base():
@@ -286,8 +317,8 @@ def mchbar_base():
     return value & 0x7FFFFF8000
 
 
-def power_limits(cpu, write_watts=None):
-    """Return (PL1 W, PL2 W) from the MCHBAR mirror, optionally setting PL1 first.
+def power_limits(cpu, profile=None):
+    """Return the power limits of the MCHBAR mirror, optionally writing those of profile first.
 
     MSR 0x610 is often locked by the firmware; this mirror usually is not,
     and the CPU enforces the lower of the two.
@@ -295,10 +326,10 @@ def power_limits(cpu, write_watts=None):
     address = mchbar_base() + MCHBAR_PL_OFFSET
     page, index = address & ~0xFFF, (address & 0xFFF) // 4
     try:
-        fd = os.open("/dev/mem", (os.O_RDWR if write_watts else os.O_RDONLY) | os.O_SYNC)
+        fd = os.open("/dev/mem", (os.O_RDWR if profile else os.O_RDONLY) | os.O_SYNC)
     except PermissionError as err:
         raise Unsupported("/dev/mem access refused; boot with iomem=relaxed") from err
-    prot = mmap.PROT_READ | (mmap.PROT_WRITE if write_watts else 0)
+    prot = mmap.PROT_READ | (mmap.PROT_WRITE if profile else 0)
     try:
         try:
             area = mmap.mmap(fd, 4096, mmap.MAP_SHARED, prot, offset=page)
@@ -307,14 +338,16 @@ def power_limits(cpu, write_watts=None):
                 "the kernel refused to map MCHBAR (CONFIG_IO_STRICT_DEVMEM); boot with iomem=relaxed"
             ) from err
         regs = memoryview(area).cast("I")  # keeps accesses 32-bit wide
-        if write_watts:
-            regs[index] = (regs[index] & ~0x7FFF) | round(write_watts * cpu["power_unit"])
+        if profile:
+            value = encode_power(regs[index] | regs[index + 1] << 32, cpu, profile)
+            regs[index + 1] = value >> 32  # PL2 first, so it never sits below a raised PL1
+            regs[index] = value & 0xFFFFFFFF
         low, high = regs[index], regs[index + 1]
         regs.release()
         area.close()
     finally:
         os.close(fd)
-    return (low & 0x7FFF) / cpu["power_unit"], (high & 0x7FFF) / cpu["power_unit"]
+    return decode_power(low | high << 32, cpu)
 
 
 def get_turbo():
@@ -629,13 +662,16 @@ def factory_limits(cpu):
         if is_amd(cpu) and set(amd_limits(cpu)) <= set(factory):
             return factory
         if not is_amd(cpu) and len(factory["ratios"]) == cpu["cores"]:
+            # Recorded before turboctl 1.2 changed PL2 and tau; the MSR still holds them.
+            for key, value in msr_power(cpu).items():
+                factory.setdefault(key, value)
             return factory
     except (OSError, ValueError, KeyError, TypeError):
         pass
     # Nothing written yet this boot, so the registers still hold the factory values.
     if is_amd(cpu):
         return dict(amd_limits(cpu), max_freq=cpu["max_freq"])
-    return {"ratios": get_ratios(cpu), "tcc": get_tcc(cpu), "pl1": msr_pl1(cpu)}
+    return dict(msr_power(cpu), ratios=get_ratios(cpu), tcc=get_tcc(cpu))
 
 
 def record_factory_limits(cpu):
@@ -652,6 +688,9 @@ def bounds(cpu, factory):
     return {
         "ratio": [cpu["base_ratio"], max(factory["ratios"])],
         "pl1": [max(5, round(factory["pl1"] * 0.3)), int(factory["pl1"])],
+        # Factory PL2 and window as they are (58.75 W, not 58), so "stock" and "cool" keep them exactly.
+        "pl2": [max(5, round(factory["pl1"] * 0.3)), max(factory["pl1"], factory["pl2"])],
+        "tau": [min(1, factory["tau"]), factory["tau"]],
         "tcc": [max(60, cpu["tjmax"] - 35), cpu["tjmax"]],
         "undervolt": [UNDERVOLT_MIN, 0],
     }
@@ -661,13 +700,22 @@ def build_profiles(cpu, factory):
     if is_amd(cpu):
         stock, cool = amd_stock(cpu, factory), amd_cool(cpu, factory)
     else:
-        stock = {"ratios": factory["ratios"], "pl1": int(factory["pl1"]), "tcc": factory["tcc"]}
         limits = bounds(cpu, factory)
+        stock = {
+            "ratios": factory["ratios"],
+            "pl1": int(factory["pl1"]),
+            "pl2": limits["pl2"][1],
+            "tau": limits["tau"][1],
+            "tcc": factory["tcc"],
+        }
         # "cool": one ratio step less per extra active core, 65 % of PL1, throttle 15 C below TjMax.
-        # On an i7-5700HQ this keeps a sustained all-core load around 85 C.
+        # On an i7-5700HQ this keeps a sustained all-core load around 85 C. PL2 and the PL1
+        # window stay at the factory values; lowering them is left to the custom profile.
         cool = {
             "ratios": [max(cpu["base_ratio"], ratio - i) for i, ratio in enumerate(factory["ratios"])],
             "pl1": max(limits["pl1"][0], int(factory["pl1"] * 0.65)),
+            "pl2": limits["pl2"][1],
+            "tau": limits["tau"][1],
             "tcc": max(limits["tcc"][0], min(factory["tcc"], cpu["tjmax"] - 15)),
         }
     profiles = {
@@ -687,7 +735,8 @@ def valid_profile(profile, cpu, factory):
     if is_amd(cpu):
         return amd_valid(profile, cpu, factory)
     limits = bounds(cpu, factory)
-    ratios, pl1, tcc = profile.get("ratios"), profile.get("pl1"), profile.get("tcc")
+    ratios, tcc = profile.get("ratios"), profile.get("tcc")
+    pl1, pl2, tau = profile.get("pl1"), profile.get("pl2"), profile.get("tau")
     low, high = limits["ratio"]
     return (
         isinstance(profile.get("turbo"), bool)
@@ -697,6 +746,10 @@ def valid_profile(profile, cpu, factory):
         and ratios == sorted(ratios, reverse=True)  # the CPU expects no rise with more active cores
         and type(pl1) is int
         and limits["pl1"][0] <= pl1 <= limits["pl1"][1]
+        and type(pl2) in (int, float)
+        and max(pl1, limits["pl2"][0]) <= pl2 <= limits["pl2"][1]
+        and type(tau) in (int, float)
+        and limits["tau"][0] <= tau <= limits["tau"][1]
         and type(tcc) is int
         and limits["tcc"][0] <= tcc <= limits["tcc"][1]
     )
@@ -708,6 +761,10 @@ def load_custom(cpu, factory):
             profile = json.load(f)
     except (OSError, ValueError):
         return None
+    if isinstance(profile, dict) and not is_amd(cpu) and "pl2" not in profile:
+        # Saved before turboctl 1.2: keep the factory PL2 and window it was running with.
+        limits = bounds(cpu, factory)
+        profile.update(pl2=limits["pl2"][1], tau=limits["tau"][1])
     return profile if valid_profile(profile, cpu, factory) else None
 
 
@@ -741,20 +798,22 @@ def write_limits(cpu, profile):
         if get_tcc(cpu) != profile["tcc"]:
             raise OSError(errno.EIO, f"throttle temperature not applied, read {get_tcc(cpu)} C")
 
-    set_pl1(cpu, profile["pl1"])
+    set_power(cpu, profile)
 
 
-def set_pl1(cpu, watts):
+def set_power(cpu, profile):
     try:
-        applied = power_limits(cpu, watts)[0]
+        applied = power_limits(cpu, profile)
     except Unsupported:
         value = rdmsr(MSR_PKG_POWER_LIMIT)
         if value >> 63:  # locked by the firmware: the MMIO mirror was the only way
             raise
-        wrmsr(MSR_PKG_POWER_LIMIT, (value & ~0x7FFF) | round(watts * cpu["power_unit"]))
-        applied = msr_pl1(cpu)
-    if applied != watts:
-        raise OSError(errno.EIO, f"PL1 not applied, read {applied:g} W")
+        wrmsr(MSR_PKG_POWER_LIMIT, encode_power(value, cpu, profile))
+        applied = msr_power(cpu)
+    tau = window_seconds(window_bits(profile["tau"], cpu), cpu)
+    if (applied["pl1"], applied["pl2"], applied["tau"]) != (profile["pl1"], profile["pl2"], tau):
+        read = f"{applied['pl1']:g} W / {applied['pl2']:g} W / {applied['tau']:g} s"
+        raise OSError(errno.EIO, f"power limits not applied, read {read}")
 
 
 def lock(path):
@@ -944,6 +1003,7 @@ def power_sampler():
 
 
 def active_limits():
+    """The limits holding the CPU back right now (status bits, not the sticky log bits)."""
     for reg in LIMIT_REASON_MSRS:
         try:
             reasons = rdmsr(reg)
@@ -975,7 +1035,7 @@ def core_freqs(cpu):
 
 
 def fields(cpu):
-    return amd_fields(cpu) if is_amd(cpu) else ["ratios", "pl1", "tcc"]
+    return amd_fields(cpu) if is_amd(cpu) else ["ratios", "pl1", "pl2", "tau", "tcc"]
 
 
 def current_values(cpu):
@@ -987,10 +1047,10 @@ def current_values(cpu):
             return {}
         return {key: limits.get(key) for key in amd_fields(cpu)}
     try:
-        pl1 = power_limits(cpu)[0]
+        power = power_limits(cpu)
     except (OSError, Unsupported):
-        pl1 = None
-    return {"ratios": get_ratios(cpu), "pl1": pl1, "tcc": get_tcc(cpu)}
+        power = {"pl1": None, "pl2": None, "tau": None}
+    return dict(power, ratios=get_ratios(cpu), tcc=get_tcc(cpu))
 
 
 def amd_status(cpu, profiles):
@@ -1022,8 +1082,8 @@ def status(cpu, profiles):
     ratios = " / ".join(f"{r / 10:.1f}" for r in get_ratios(cpu))
     print(f"ratios 1-{cpu['cores']}c   : {ratios} GHz{'' if cpu['ratio_writable'] else ' (locked)'}")
     try:
-        pl1, pl2 = power_limits(cpu)
-        print(f"PL1 / PL2     : {pl1:g} W / {pl2:g} W")
+        power = power_limits(cpu)
+        print(f"PL1 / PL2     : {power['pl1']:g} W over {power['tau']:g} s / {power['pl2']:g} W")
     except (OSError, Unsupported) as err:
         print(f"PL1 / PL2     : unavailable ({err})")
     print(f"throttle at   : {get_tcc(cpu)} C (TjMax {cpu['tjmax']} C){'' if cpu['tcc_writable'] else ' (locked)'}")
@@ -1032,12 +1092,25 @@ def status(cpu, profiles):
         print(f"                reset to 0 after an unclean shutdown at {undervolt_crash()} mV")
 
 
+def limits_over_second(cpu, stop=lambda timeout: time.sleep(timeout) or False):
+    """The limits that held the CPU back during the next second, or until stop(timeout) is true.
+
+    Intel status bits change in milliseconds, so one read a second misses most of them.
+    """
+    polls = 1 if is_amd(cpu) else LIMIT_POLLS
+    seen = []
+    for _ in range(polls):
+        seen += cpu_active_limits(cpu)
+        if stop(1 / polls):
+            break
+    return list(dict.fromkeys(seen))
+
+
 def monitor(cpu):
     sample_watts = cpu_power_sampler(cpu)
     print("temp_C watts MHz limits", flush=True)
     while True:
-        time.sleep(1)
-        limits = ",".join(cpu_active_limits(cpu)) or "-"
+        limits = ",".join(limits_over_second(cpu)) or "-"
         print(f"{cpu_temp(cpu)} {sample_watts():.1f} {max(core_freqs(cpu))} {limits}", flush=True)
 
 
@@ -1091,7 +1164,8 @@ def serve(cpu):
     sample_watts = cpu_power_sampler(cpu)
     watts, error = 0.0, None
     while True:
-        if select.select([0], [], [], 1)[0]:
+        limits = limits_over_second(cpu, lambda timeout: select.select([0], [], [], timeout)[0])
+        if select.select([0], [], [], 0)[0]:
             data = os.read(0, 65536)
             if not data:
                 return
@@ -1104,7 +1178,9 @@ def serve(cpu):
         if is_amd(cpu):
             writable = {key: True for key in amd_fields(cpu)}
         else:
-            writable = {"ratios": cpu["ratio_writable"], "pl1": values["pl1"] is not None, "tcc": cpu["tcc_writable"]}
+            power = values["pl1"] is not None
+            writable = {"ratios": cpu["ratio_writable"], "tcc": cpu["tcc_writable"], "pl1": power, "pl2": power}
+            writable["tau"] = power
         state = {
             "version": __version__,
             "cpu": {k: cpu[k] for k in ("name", "generation", "tested", "cores")},
@@ -1118,7 +1194,7 @@ def serve(cpu):
             "temp": cpu_temp(cpu),
             "watts": round(watts, 1),
             "freqs": core_freqs(cpu),
-            "limits": cpu_active_limits(cpu),
+            "limits": limits,
             "notes": [cpu["smu_note"]] if is_amd(cpu) and cpu["smu_note"] else [],
             "undervolt": None if is_amd(cpu) else saved_undervolt(),
             "undervolt_crash": None if is_amd(cpu) else undervolt_crash(),

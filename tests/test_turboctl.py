@@ -37,8 +37,9 @@ I7_5700HQ = {
     "ratio_writable": True,
     "tcc_writable": True,
     "power_unit": 8,
+    "time_unit": 1 / 1024,
 }
-FACTORY = {"ratios": [35, 35, 35, 35], "tcc": 103, "pl1": 47.0}
+FACTORY = {"ratios": [35, 35, 35, 35], "tcc": 103, "pl1": 47.0, "pl2": 58.75, "tau": 28.0}
 
 
 class Profiles(unittest.TestCase):
@@ -50,17 +51,21 @@ class Profiles(unittest.TestCase):
     def test_cool_matches_the_measured_profile(self):
         # Measured on an i7-5700HQ: 85 C max with 8 threads of AVX load for 8 minutes.
         cool = turboctl.build_profiles(I7_5700HQ, FACTORY)["cool"]
-        self.assertEqual(cool, {"ratios": [35, 34, 33, 32], "pl1": 30, "tcc": 90, "turbo": True})
+        self.assertEqual(
+            cool, {"ratios": [35, 34, 33, 32], "pl1": 30, "pl2": 58.75, "tau": 28.0, "tcc": 90, "turbo": True}
+        )
 
     def test_stock_and_off_keep_factory_limits(self):
         profiles = turboctl.build_profiles(I7_5700HQ, FACTORY)
-        self.assertEqual(profiles["stock"], {"ratios": [35] * 4, "pl1": 47, "tcc": 103, "turbo": True})
+        self.assertEqual(
+            profiles["stock"], {"ratios": [35] * 4, "pl1": 47, "pl2": 58.75, "tau": 28.0, "tcc": 103, "turbo": True}
+        )
         self.assertFalse(profiles["off"]["turbo"])
         self.assertNotIn("custom", profiles)
 
     def test_cool_never_goes_below_base_or_rises(self):
         cpu = dict(I7_5700HQ, cores=8, base_ratio=30)
-        factory = {"ratios": [33, 33, 32, 32, 31, 31, 31, 31], "tcc": 100, "pl1": 15.0}
+        factory = {"ratios": [33, 33, 32, 32, 31, 31, 31, 31], "tcc": 100, "pl1": 15.0, "pl2": 25.0, "tau": 28.0}
         cool = turboctl.build_profiles(cpu, factory)["cool"]
         self.assertEqual(cool["ratios"], [33, 32, 30, 30, 30, 30, 30, 30])
         self.assertTrue(turboctl.valid_profile(cool, cpu, factory))
@@ -73,11 +78,18 @@ class Profiles(unittest.TestCase):
     def test_bounds(self):
         self.assertEqual(
             turboctl.bounds(I7_5700HQ, FACTORY),
-            {"ratio": [27, 35], "pl1": [14, 47], "tcc": [70, 105], "undervolt": [-100, 0]},
+            {
+                "ratio": [27, 35],
+                "pl1": [14, 47],
+                "pl2": [14, 58.75],
+                "tau": [1, 28.0],
+                "tcc": [70, 105],
+                "undervolt": [-100, 0],
+            },
         )
 
     def test_invalid_profiles(self):
-        good = {"turbo": True, "ratios": [35, 34, 33, 32], "pl1": 30, "tcc": 90}
+        good = {"turbo": True, "ratios": [35, 34, 33, 32], "pl1": 30, "pl2": 35, "tau": 5, "tcc": 90}
         bad = {
             "rising ratios": dict(good, ratios=[32, 33, 34, 35]),
             "ratio above factory": dict(good, ratios=[36, 34, 33, 32]),
@@ -85,6 +97,12 @@ class Profiles(unittest.TestCase):
             "wrong core count": dict(good, ratios=[35, 34]),
             "PL1 too high": dict(good, pl1=48),
             "PL1 as bool": dict(good, pl1=True),
+            "PL2 below PL1": dict(good, pl2=29),
+            "PL2 too high": dict(good, pl2=58.8),
+            "PL2 as bool": dict(good, pl2=True),
+            "window too long": dict(good, tau=29),
+            "window of zero": dict(good, tau=0),
+            "no PL2": {k: v for k, v in good.items() if k != "pl2"},
             "throttle too low": dict(good, tcc=69),
             "turbo not bool": dict(good, turbo=1),
             "not a dict": [good],
@@ -93,6 +111,38 @@ class Profiles(unittest.TestCase):
         for name, profile in bad.items():
             with self.subTest(name):
                 self.assertFalse(turboctl.valid_profile(profile, I7_5700HQ, FACTORY))
+
+
+    def test_custom_saved_before_pl2_keeps_the_factory_pl2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "custom.json")
+            with open(path, "w") as f:
+                json.dump({"turbo": True, "ratios": [35, 34, 33, 32], "pl1": 30, "tcc": 90}, f)
+            with mock.patch.object(turboctl, "CUSTOM_FILE", path):
+                custom = turboctl.build_profiles(I7_5700HQ, FACTORY)["custom"]
+        self.assertEqual((custom["pl1"], custom["pl2"], custom["tau"]), (30, 58.75, 28.0))
+
+
+class PowerRegister(unittest.TestCase):
+    # MSR 0x610 as an i7-5700HQ laptop firmware sets it: PL1 47 W over 28 s, PL2 58.75 W, locked.
+    FIRMWARE = 0x804281D600DD8178
+
+    def test_decode(self):
+        self.assertEqual(
+            turboctl.decode_power(self.FIRMWARE, I7_5700HQ), {"pl1": 47.0, "pl2": 58.75, "tau": 28.0}
+        )
+
+    def test_encode_keeps_the_other_bits(self):
+        value = turboctl.encode_power(self.FIRMWARE, I7_5700HQ, {"pl1": 30, "pl2": 35, "tau": 5})
+        self.assertEqual(turboctl.decode_power(value, I7_5700HQ), {"pl1": 30.0, "pl2": 35.0, "tau": 5.0})
+        mask = 0x7FFF | 0x7F << 17 | 0x7FFF << 32
+        self.assertEqual(value & ~mask, self.FIRMWARE & ~mask)
+
+    def test_window_rounds_to_the_nearest_step(self):
+        for seconds, expected in ((1, 1.0), (7, 7.0), (9, 8.0), (28, 28.0)):
+            with self.subTest(seconds):
+                bits = turboctl.window_bits(seconds, I7_5700HQ)
+                self.assertEqual(turboctl.window_seconds(bits, I7_5700HQ), expected)
 
 
 # A Ryzen 7 H 255 as detect_amd() reports it, with SMU access, and its factory limits.

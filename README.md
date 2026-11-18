@@ -24,7 +24,7 @@ Linux with systemd, and:
 
 | CPU | Settings | Status |
 |---|---|---|
-| Intel Broadwell (5th gen) | turbo ratios, PL1, throttle temperature, undervolt | tested (i7-5700HQ) |
+| Intel Broadwell (5th gen) | turbo ratios, PL1, PL2 and PL1 window, throttle temperature, undervolt | tested (i7-5700HQ) |
 | Intel Haswell, Skylake, Kaby Lake, Coffee Lake, Whiskey Lake, Comet Lake | same | expected to work, **untested** |
 | AMD Ryzen 7040/8040 and 200 series (Phoenix, Hawk Point) | max frequency, sustained power, throttle temperature | tested (Ryzen 7 H 255) |
 | AMD Ryzen 6000 and 7035 (Rembrandt) | same | expected to work, **untested** |
@@ -100,12 +100,20 @@ password instead, install with `sudo NOPASSWD=0 ./install.sh`.
 
 Values derived from each CPU's factory limits (example: i7-5700HQ):
 
-| Profile | Turbo | Ratio per active core | PL1 | Throttle at |
-|---|---|---|---|---|
-| `off` | off | factory | factory (47 W) | factory (103 °C) |
-| `cool` | on | factory minus one step per extra core (3.5 / 3.4 / 3.3 / 3.2 GHz) | 65 % of factory (30 W) | TjMax − 15 °C (90 °C) |
-| `stock` | on | factory (3.5 GHz) | factory (47 W) | factory (103 °C) |
-| `custom` | set in the window | | | |
+| Profile | Turbo | Ratio per active core | PL1 | PL2 | PL1 window | Throttle at |
+|---|---|---|---|---|---|---|
+| `off` | off | factory | factory (47 W) | factory (58 W) | factory (28 s) | factory (103 °C) |
+| `cool` | on | factory minus one step per extra core (3.5 / 3.4 / 3.3 / 3.2 GHz) | 65 % of factory (30 W) | factory (58 W) | factory (28 s) | TjMax − 15 °C (90 °C) |
+| `stock` | on | factory (3.5 GHz) | factory (47 W) | factory (58 W) | factory (28 s) | factory (103 °C) |
+| `custom` | set in the window | | | | | |
+
+PL1 is an average over the PL1 window, and PL2 caps the power within it. With the factory
+28 s window and 58 W PL2, a CPU limited to 30 W still runs well above 30 W for several
+seconds after each idle moment, and its temperature can overshoot the throttle point.
+Lower PL2 (for example PL1 + 5 W) and the window (for example 5 s) in the `custom` profile
+to keep the power close to PL1.
+The window rounds to the steps the CPU offers (every second up to 8 s, then 10, 12, 14,
+16, 20, 24, 28 s).
 
 On AMD (example: Ryzen 7 H 255, factory 40 W average / 42 W sustained, 100 °C):
 
@@ -122,7 +130,7 @@ without heating it for long.
 
 ```sh
 sudo turboctl status         # CPU, limits in place, undervolt
-sudo turboctl monitor        # temperature, watts, ratio, active limit, once a second
+sudo turboctl monitor        # temperature, watts, ratio, limits hit during each second
 sudo turboctl set cool       # apply and save a profile
 sudo turboctl apply          # apply the saved profile again
 sudo turboctl update         # install the latest signed release, if newer
@@ -164,7 +172,7 @@ use the value for a few days (idle, video, sleep and resume) and watch
 |---|---|
 | Max ratio per number of active cores | MSR `0x1AD` |
 | Throttle temperature (offset from TjMax) | MSR `0x1A2` |
-| PL1 power limit | MMIO mirror at MCHBAR + `0x59A0` (MSR `0x610` is often locked); MSR `0x610` if the mirror is unavailable |
+| PL1, PL2 and PL1 window | MMIO mirror at MCHBAR + `0x59A0` (MSR `0x610` is often locked); MSR `0x610` if the mirror is unavailable |
 | Undervolt | MSR `0x150`, planes 0 (cores) and 2 (cache) |
 | Turbo on/off | `intel_pstate/no_turbo` or `cpufreq/boost`, and bit 38 of MSR `0x1A0` |
 
