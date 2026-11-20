@@ -38,6 +38,11 @@ if [ "$files_only" = 0 ]; then
     systemctl disable turboctl.service turboctl-shutdown.service 2>/dev/null || true
     # Stopping the shutdown unit removes the undervolt marker, as at a clean shutdown.
     systemctl stop turboctl-shutdown.service 2>/dev/null || true
+    # The voltage offset outlives a reboot: remove it now, but keep the saved value.
+    saved=$(cat /var/lib/turboctl/undervolt 2>/dev/null || true)
+    if "$SBINDIR/turboctl" undervolt 0 >/dev/null 2>&1 && [ -n "$saved" ]; then
+        echo "$saved" > /var/lib/turboctl/undervolt
+    fi
 fi
 
 rm -f "$DESTDIR$SBINDIR/turboctl" \

@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.3.0
+
+- Automatic updates wait while a game runs under GameMode: installing restarts the
+  service, which turns turbo off for about a second
+- The *PL1 averaged over* slider stops only on the durations the CPU can hold
+  (1 to 8 s, then 10, 12, 14, 16, 20, 24 and 28 s on an i7-5700HQ)
+- On battery, the active limit is read once a second instead of 10 times
+- `uninstall.sh` sets the undervolt back to 0 mV: the offset outlives a warm reboot
+
 ## 1.2.1
 
 - Intel: an undervolt of 0 mV, the default, made the CPU go back to its factory turbo

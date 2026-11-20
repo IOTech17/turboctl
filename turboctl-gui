@@ -109,7 +109,7 @@ def watts(value):
 FIELDS = {
     "pl1": (N_("Max power (PL1)"), lambda v: f"{v:.0f} W", 1),
     "pl2": (N_("Burst power (PL2)"), lambda v: f"{v:.0f} W", 1),
-    "tau": (N_("PL1 averaged over"), lambda v: f"{v:.0f} s", 1),
+    "tau": (N_("PL1 averaged over"), lambda v: f"{v:g} s", 1),
     "tcc": (N_("Throttle at"), lambda v: f"{v:.0f} °C", 1),
     "max_freq": (N_("Max frequency"), ghz, 100),
     "power": (N_("Sustained power"), lambda v: f"{v:.0f} W", 1),
@@ -425,6 +425,8 @@ class Panel(Gtk.ApplicationWindow):
         self.controls_built = False
         self.ratio_scales = []
         self.scales = {}
+        self.tau_steps = []
+        self.tau_previous = None
         self.uv_scale = None
         # Functions that set a text in the current language, run again when it changes.
         self.texts = []
@@ -577,6 +579,11 @@ class Panel(Gtk.ApplicationWindow):
             scale = self.make_scale(*bounds[key], formatter, step)
             scale.connect("value-changed", self.on_setting_changed, key)
             scale.set_sensitive(writable[key])
+            if key == "tau":
+                # The CPU holds only some durations: the slider stops on those.
+                self.tau_steps = state.get("tau_steps") or []
+                for step in self.tau_steps:
+                    scale.add_mark(step, Gtk.PositionType.BOTTOM, None)
             self.scales[key] = scale
             grid.attach(self.caption(text), 0, line, 1, 1)
             grid.attach(scale, 1, line, 1, 1)
@@ -720,6 +727,8 @@ class Panel(Gtk.ApplicationWindow):
     def on_setting_changed(self, scale, key):
         if self.loading:
             return
+        if key == "tau" and self.tau_steps:
+            self.snap_tau(scale)
         # PL2 can never be below PL1: moving one past the other drags it along.
         pl1, pl2 = self.scales.get("pl1"), self.scales.get("pl2")
         if pl1 and pl2 and pl2.get_value() < pl1.get_value():
@@ -727,6 +736,21 @@ class Panel(Gtk.ApplicationWindow):
             (pl2 if key == "pl1" else pl1).set_value(scale.get_value())
             self.loading = False
         self.mark_modified()
+
+    def snap_tau(self, scale):
+        value, previous = scale.get_value(), self.tau_previous
+        if value == previous:
+            return
+        # Toward the move, so a one-second key press still reaches the next step.
+        ahead = [] if previous is None else [
+            step for step in self.tau_steps if step != previous and (step > previous) == (value > previous)
+        ]
+        target = min(ahead or self.tau_steps, key=lambda step: abs(step - value))
+        self.tau_previous = target
+        if target != value:
+            self.loading = True
+            scale.set_value(target)
+            self.loading = False
 
     def on_ratio_changed(self, scale, index):
         if self.loading:
@@ -754,6 +778,7 @@ class Panel(Gtk.ApplicationWindow):
         for key, scale in self.scales.items():
             if values.get(key) is not None:
                 scale.set_value(values[key])
+        self.tau_previous = values.get("tau")
         self.loading = False
         self.update_sensitivity()
 

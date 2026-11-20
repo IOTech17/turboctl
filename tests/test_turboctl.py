@@ -144,6 +144,36 @@ class PowerRegister(unittest.TestCase):
                 bits = turboctl.window_bits(seconds, I7_5700HQ)
                 self.assertEqual(turboctl.window_seconds(bits, I7_5700HQ), expected)
 
+    def test_window_steps_offered_in_the_window(self):
+        self.assertEqual(
+            turboctl.window_steps(I7_5700HQ, FACTORY), [1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 28]
+        )
+
+
+class LimitPolls(unittest.TestCase):
+    def supplies(self, files):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root)
+        for path, text in files.items():
+            os.makedirs(os.path.join(root, os.path.dirname(path)), exist_ok=True)
+            with open(os.path.join(root, path), "w") as f:
+                f.write(text + "\n")
+        return mock.patch.object(turboctl.glob, "glob", lambda _pattern: sorted(
+            os.path.join(root, name) for name in os.listdir(root)))
+
+    def polls(self, files):
+        reads = []
+        with self.supplies(files), mock.patch.object(turboctl, "cpu_active_limits", lambda cpu: reads.append(1) or []):
+            turboctl.limits_over_second(I7_5700HQ, stop=lambda timeout: False)
+        return len(reads)
+
+    def test_ten_reads_on_mains_one_on_battery(self):
+        mains = {"AC/type": "Mains", "AC/online": "1", "BAT0/type": "Battery", "BAT0/status": "Charging"}
+        battery = {"AC/type": "Mains", "AC/online": "0", "BAT0/type": "Battery", "BAT0/status": "Discharging"}
+        self.assertEqual(self.polls(mains), turboctl.LIMIT_POLLS)
+        self.assertEqual(self.polls(battery), 1)
+        self.assertEqual(self.polls({}), turboctl.LIMIT_POLLS)  # a desktop
+
 
 # A Ryzen 7 H 255 as detect_amd() reports it, with SMU access, and its factory limits.
 RYZEN_H255 = {
@@ -301,6 +331,7 @@ class Update(unittest.TestCase):
         with open(self.settings, "w") as f:
             f.write("PREFIX=/usr\nNOPASSWD=1\n")
         self.installs = []
+        self.games, self.sleeps = [], []  # GameMode answers, then the waits between them
 
     def release(self, version, tamper=False):
         """Build turboctl-VERSION.tar.gz from this tree with that version, and sign it."""
@@ -339,13 +370,21 @@ class Update(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 0)
             return real_run(args, **kwargs)
 
-        with mock.patch.multiple(turboctl, fetch=fetch, ALLOWED_SIGNERS=self.signers, INSTALL_FILE=self.settings), \
-                mock.patch.object(turboctl.subprocess, "run", run), mock.patch("builtins.print"):
+        with mock.patch.multiple(turboctl, fetch=fetch, ALLOWED_SIGNERS=self.signers, INSTALL_FILE=self.settings,
+                                 gamemode_active=lambda: self.games.pop(0) if self.games else False), \
+                mock.patch.object(turboctl.subprocess, "run", run), mock.patch("builtins.print"), \
+                mock.patch.object(turboctl.time, "sleep", lambda seconds: self.sleeps.append(seconds)):
             turboctl.update()
 
     def test_installs_a_newer_signed_release(self):
         self.run_update(self.release("99.0.0"))
         self.assertEqual(self.installs, [(["sh", "install.sh", "--update"], "/usr")])
+
+    def test_waits_for_the_game_to_end(self):
+        self.games = [True, True, True]
+        self.run_update(self.release("99.0.0"))
+        self.assertEqual(self.sleeps, [turboctl.GAMEMODE_RETRY] * 2)
+        self.assertEqual(len(self.installs), 1)
 
     def test_refuses_a_modified_archive(self):
         with self.assertRaises(SystemExit) as caught:
@@ -362,6 +401,31 @@ class Update(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.run_update(self.release("99.0.0"))
         self.assertEqual(self.installs, [])
+
+
+class GameMode(unittest.TestCase):
+    def active(self, answers):
+        """answers: the busctl output for each logged-in user, or None for an error."""
+        users = "\n".join(f"{1000 + i} user{i} no active" for i in range(len(answers)))
+
+        def run(args, **kwargs):
+            if args[0] == "loginctl":
+                return subprocess.CompletedProcess(args, 0, users + "\n", "")
+            answer = answers[int(args[1].split("@")[0][len("--machine=user"):])]
+            return subprocess.CompletedProcess(args, 1 if answer is None else 0, answer or "", "")
+
+        with mock.patch.object(turboctl.subprocess, "run", run):
+            return turboctl.gamemode_active()
+
+    def test_client_count(self):
+        self.assertFalse(self.active([]))
+        self.assertFalse(self.active(["i 0\n"]))
+        self.assertFalse(self.active([None]))  # GameMode not running for that user
+        self.assertTrue(self.active([None, "i 1\n"]))
+
+    def test_without_systemd(self):
+        with mock.patch.object(turboctl.subprocess, "run", side_effect=FileNotFoundError):
+            self.assertFalse(turboctl.gamemode_active())
 
 
 class UpdateInterval(unittest.TestCase):

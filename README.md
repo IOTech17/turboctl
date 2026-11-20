@@ -70,7 +70,9 @@ anything, and such installs never update themselves. See the variables at the to
 (every 12 hours, daily, weekly, monthly or never) or with `sudo turboctl update-interval 12h`. It installs it only if the archive is signed with the release key (the
 public key is `data/allowed_signers`; the private key is not on GitHub), if it contains the
 announced version, and if its tests pass on the machine. The saved profile is kept and the
-window restarts in the new version. To install new releases by hand instead, install with
+window restarts in the new version. Installing turns turbo off for about a second, so while
+a game runs under [GameMode](https://github.com/FeralInteractive/gamemode), the update waits
+for it to end. To install new releases by hand instead, install with
 *Never* in the window or `sudo AUTO_UPDATE=0 ./install.sh`, and run `sudo turboctl update`
 when you want.
 
@@ -159,6 +161,10 @@ sudo turboctl undervolt -50  # or the Undervolt slider and its Apply button
   value and suggests the last stable step plus a 15 mV margin. Its log,
   `/var/lib/turboctl/uvtest.log`, is synced line by line: after a freeze it shows the step
   that crashed.
+
+The offset outlives a warm reboot: only a cold boot clears it. At boot, `turboctl.service`
+writes the saved value, or 0 mV after a crash, and `uninstall.sh` sets 0 mV before removing
+the files.
 
 On the test machine, −80 mV passed both full-load phases but corrupted the kernel under
 light load, with no machine check and no wrong result: only a scheduler stall and a kernel

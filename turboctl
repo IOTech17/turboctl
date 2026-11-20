@@ -22,6 +22,7 @@ limits on Ryzen 6000/7035 (Rembrandt), 7040/8040 (Phoenix, Hawk Point) and 200 s
 """
 import errno
 import fcntl
+import glob
 import json
 import mmap
 import os
@@ -37,7 +38,7 @@ import time
 import urllib.error
 import urllib.request
 
-__version__ = "1.2.1"
+__version__ = "1.3.0"
 
 STATE_DIR = "/var/lib/turboctl"
 PROFILE_FILE = STATE_DIR + "/profile"
@@ -104,7 +105,8 @@ MSR_PKG_POWER_LIMIT = 0x610
 MSR_PKG_ENERGY = 0x611
 LIMIT_REASON_MSRS = (0x64F, 0x690)  # Skylake and later, then Haswell/Broadwell
 LIMIT_REASON_BITS = {0: "PROCHOT", 1: "THERMAL", 10: "PL1", 11: "PL2", 12: "MAX_TURBO"}
-LIMIT_POLLS = 10  # reads of the limit reasons per second
+LIMIT_POLLS = 10  # reads of the limit reasons per second (once a second on battery)
+GAMEMODE_RETRY = 60  # seconds between checks while an update waits for a game to end
 
 MCHBAR_PCI_CONFIG = "/sys/bus/pci/devices/0000:00:00.0/config"
 MCHBAR_PL_OFFSET = 0x59A0  # MMIO mirror of the package power limits
@@ -279,6 +281,13 @@ def get_tcc(cpu):
 def window_seconds(bits, cpu):
     """PL1 time window of a 7-bit field: 2^Y * (1 + Z/4) time units."""
     return 2 ** (bits & 0x1F) * (1 + (bits >> 5 & 3) / 4) * cpu["time_unit"]
+
+
+def window_steps(cpu, factory):
+    """The PL1 windows the CPU can hold, in seconds, within the bounds: whole seconds and the bounds."""
+    low, high = bounds(cpu, factory)["tau"]
+    steps = {window_seconds(bits, cpu) for bits in range(0x80)}
+    return sorted(s for s in steps if low <= s <= high and (s == int(s) or s in (low, high)))
 
 
 def window_bits(seconds, cpu):
@@ -1099,12 +1108,24 @@ def status(cpu, profiles):
         print(f"                reset to 0 after an unclean shutdown at {undervolt_crash()} mV")
 
 
+def on_battery():
+    """True while a battery is discharging."""
+    for supply in glob.glob("/sys/class/power_supply/*"):
+        try:
+            if read_text(supply + "/type") == "Battery" and read_text(supply + "/status") == "Discharging":
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def limits_over_second(cpu, stop=lambda timeout: time.sleep(timeout) or False):
     """The limits that held the CPU back during the next second, or until stop(timeout) is true.
 
-    Intel status bits change in milliseconds, so one read a second misses most of them.
+    Intel status bits change in milliseconds, so one read a second misses most of them;
+    on battery, one read a second saves the wakeups.
     """
-    polls = 1 if is_amd(cpu) else LIMIT_POLLS
+    polls = 1 if is_amd(cpu) or on_battery() else LIMIT_POLLS
     seen = []
     for _ in range(polls):
         seen += cpu_active_limits(cpu)
@@ -1205,6 +1226,7 @@ def serve(cpu):
             "notes": [cpu["smu_note"]] if is_amd(cpu) and cpu["smu_note"] else [],
             "undervolt": None if is_amd(cpu) else saved_undervolt(),
             "undervolt_crash": None if is_amd(cpu) else undervolt_crash(),
+            "tau_steps": None if is_amd(cpu) else window_steps(cpu, factory),
             "update_interval": saved_update_interval(),
             "error": error,
         }
@@ -1271,6 +1293,25 @@ def set_update_interval(interval):
         subprocess.run([*systemctl, "disable", "--now", UPDATE_TIMER], check=True)
 
 
+def gamemode_active():
+    """True while a game of any logged-in user runs under GameMode (a daemon of each user)."""
+    try:
+        users = subprocess.run(["loginctl", "list-users", "--no-legend"], capture_output=True, text=True).stdout
+        for user in (line.split()[1] for line in users.splitlines() if len(line.split()) > 1):
+            query = subprocess.run(
+                ["busctl", f"--machine={user}@.host", "--user", "--auto-start=no", "get-property",
+                 "com.feralinteractive.GameMode", "/com/feralinteractive/GameMode",
+                 "com.feralinteractive.GameMode", "ClientCount"],
+                capture_output=True, text=True,
+            )
+            # "i 2" while two games run; an error when GameMode is not running for that user.
+            if query.returncode == 0 and query.stdout.split()[-1:] != ["0"]:
+                return True
+    except OSError:  # no systemd tools: nothing to wait for
+        pass
+    return False
+
+
 def update():
     """Install the latest release from GitHub if it is newer and signed with the release key."""
     settings = read_install_settings()
@@ -1318,6 +1359,11 @@ def update():
         )
         if tests.returncode != 0:
             sys.exit(f"turboctl: release {version} fails its tests on this machine, not installed:\n{tests.stderr}")
+        # Installing restarts the service, which turns turbo off for about a second: not during a game.
+        if gamemode_active():
+            print("turboctl: a game runs under GameMode; the update waits for it to end", flush=True)
+            while gamemode_active():
+                time.sleep(GAMEMODE_RETRY)
         subprocess.run(["sh", "install.sh", "--update"], cwd=source, env=dict(os.environ, **settings), check=True)
     print(f"turboctl updated from {__version__} to {version}")
 
