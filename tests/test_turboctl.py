@@ -332,6 +332,7 @@ class Update(unittest.TestCase):
             f.write("PREFIX=/usr\nNOPASSWD=1\n")
         self.installs = []
         self.games, self.sleeps = [], []  # GameMode answers, then the waits between them
+        self.hold = os.path.join(self.tmp, "update-hold.d")
 
     def release(self, version, tamper=False):
         """Build turboctl-VERSION.tar.gz from this tree with that version, and sign it."""
@@ -371,7 +372,8 @@ class Update(unittest.TestCase):
             return real_run(args, **kwargs)
 
         with mock.patch.multiple(turboctl, fetch=fetch, ALLOWED_SIGNERS=self.signers, INSTALL_FILE=self.settings,
-                                 gamemode_active=lambda: self.games.pop(0) if self.games else False), \
+                                 gamemode_active=lambda: self.games.pop(0) if self.games else False,
+                                 UPDATE_HOLD_DIR=self.hold), \
                 mock.patch.object(turboctl.subprocess, "run", run), mock.patch("builtins.print"), \
                 mock.patch.object(turboctl.time, "sleep", lambda seconds: self.sleeps.append(seconds)):
             turboctl.update()
@@ -383,8 +385,39 @@ class Update(unittest.TestCase):
     def test_waits_for_the_game_to_end(self):
         self.games = [True, True, True]
         self.run_update(self.release("99.0.0"))
-        self.assertEqual(self.sleeps, [turboctl.GAMEMODE_RETRY] * 2)
+        self.assertEqual(self.sleeps, [turboctl.HOLD_RETRY] * 2)
         self.assertEqual(len(self.installs), 1)
+
+    def hold_script(self, name, body, mode=0o755):
+        os.makedirs(self.hold, exist_ok=True)
+        path = os.path.join(self.hold, name)
+        with open(path, "w") as f:
+            f.write("#!/bin/sh\n" + body + "\n")
+        os.chmod(path, mode)
+        return path
+
+    def test_waits_while_a_hold_script_says_busy(self):
+        # Busy on the first two checks, then free: the count is kept in a file.
+        count = os.path.join(self.tmp, "count")
+        self.hold_script("10-free", "exit 0")
+        self.hold_script("20-busy", f'n=$(cat {count} 2>/dev/null || echo 0)\n'
+                                    f'echo $((n + 1)) > {count}\n[ "$n" -ge 2 ]')
+        self.run_update(self.release("99.0.0"))
+        self.assertEqual(self.sleeps, [turboctl.HOLD_RETRY])
+        self.assertEqual(len(self.installs), 1)
+
+    def test_hold_scripts_others_can_write_are_ignored(self):
+        self.hold_script("busy", "exit 1", mode=0o777)
+        self.hold_script("notes.txt", "exit 1", mode=0o644)  # not executable
+        with mock.patch.object(turboctl, "UPDATE_HOLD_DIR", self.hold), mock.patch("builtins.print"), \
+                mock.patch.object(turboctl, "gamemode_active", lambda: False):
+            self.assertIsNone(turboctl.update_hold())
+
+    def test_hold_script_timeout_is_busy(self):
+        self.hold_script("slow", "sleep 5")
+        with mock.patch.multiple(turboctl, UPDATE_HOLD_DIR=self.hold, HOLD_TIMEOUT=0.2,
+                                 gamemode_active=lambda: False):
+            self.assertIn("did not answer", turboctl.update_hold())
 
     def test_refuses_a_modified_archive(self):
         with self.assertRaises(SystemExit) as caught:

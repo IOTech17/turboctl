@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.1
+
+- Updates also wait while a script in `/etc/turboctl/update-hold.d/` says the machine is
+  busy (any exit status other than 0, or no answer within 30 s): for benchmarks and other
+  work that a second without turbo would spoil
+
 ## 1.3.0
 
 - Automatic updates wait while a game runs under GameMode: installing restarts the

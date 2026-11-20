@@ -72,7 +72,19 @@ public key is `data/allowed_signers`; the private key is not on GitHub), if it c
 announced version, and if its tests pass on the machine. The saved profile is kept and the
 window restarts in the new version. Installing turns turbo off for about a second, so while
 a game runs under [GameMode](https://github.com/FeralInteractive/gamemode), the update waits
-for it to end. To install new releases by hand instead, install with
+for it to end. Other work can hold updates back too, such as a benchmark: put an executable
+script in `/etc/turboctl/update-hold.d/` that exits 0 when the machine is free and with
+another status when it is busy. The update checks again every minute. The scripts run as
+root, with a 30 s limit (past it, the machine counts as busy), so they must belong to root
+and be writable by root only; others are ignored. For example:
+
+```sh
+sudo mkdir -p /etc/turboctl/update-hold.d
+printf '#!/bin/sh\n! pgrep -x my-benchmark >/dev/null\n' | sudo tee /etc/turboctl/update-hold.d/benchmark
+sudo chmod 755 /etc/turboctl/update-hold.d/benchmark
+```
+
+To install new releases by hand instead, install with
 *Never* in the window or `sudo AUTO_UPDATE=0 ./install.sh`, and run `sudo turboctl update`
 when you want.
 

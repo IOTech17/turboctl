@@ -29,6 +29,7 @@ import os
 import re
 import select
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -38,7 +39,7 @@ import time
 import urllib.error
 import urllib.request
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 STATE_DIR = "/var/lib/turboctl"
 PROFILE_FILE = STATE_DIR + "/profile"
@@ -63,6 +64,8 @@ UPDATE_INTERVAL_FILE = STATE_DIR + "/update-interval"
 UPDATE_TIMER = "turboctl-update.timer"
 UPDATE_TIMER_DROPIN = "/etc/systemd/system/turboctl-update.timer.d/interval.conf"
 UPDATE_PRESET = "/etc/systemd/system-preset/80-turboctl-update.preset"
+# Local scripts that can hold an update back: exit 0 when the machine is free, anything else when busy.
+UPDATE_HOLD_DIR = "/etc/turboctl/update-hold.d"
 # Factory limits, captured before turboctl's first write of each boot.
 FACTORY_FILE = "/run/turboctl/factory.json"
 # Power and temperature limits written to the SMU this boot, kept by "watch".
@@ -106,7 +109,8 @@ MSR_PKG_ENERGY = 0x611
 LIMIT_REASON_MSRS = (0x64F, 0x690)  # Skylake and later, then Haswell/Broadwell
 LIMIT_REASON_BITS = {0: "PROCHOT", 1: "THERMAL", 10: "PL1", 11: "PL2", 12: "MAX_TURBO"}
 LIMIT_POLLS = 10  # reads of the limit reasons per second (once a second on battery)
-GAMEMODE_RETRY = 60  # seconds between checks while an update waits for a game to end
+HOLD_RETRY = 60  # seconds between checks while an update waits (game, update-hold.d)
+HOLD_TIMEOUT = 30  # seconds an update-hold.d script may take to answer
 
 MCHBAR_PCI_CONFIG = "/sys/bus/pci/devices/0000:00:00.0/config"
 MCHBAR_PL_OFFSET = 0x59A0  # MMIO mirror of the package power limits
@@ -1312,6 +1316,40 @@ def gamemode_active():
     return False
 
 
+def hold_scripts():
+    """The update-hold.d scripts that may run as root: executable, owned by root, writable by root only."""
+    try:
+        names = sorted(os.listdir(UPDATE_HOLD_DIR))
+    except OSError:
+        return []
+    scripts = []
+    for name in names:
+        path = os.path.join(UPDATE_HOLD_DIR, name)
+        info = os.stat(path)
+        if not stat.S_ISREG(info.st_mode) or not os.access(path, os.X_OK):
+            continue
+        if info.st_uid not in (0, os.geteuid()) or info.st_mode & 0o022:
+            print(f"turboctl: {path} ignored: it must belong to root and be writable by root only", flush=True)
+            continue
+        scripts.append(path)
+    return scripts
+
+
+def update_hold():
+    """Return why the update must wait now, or None."""
+    if gamemode_active():
+        return "a game runs under GameMode"
+    for path in hold_scripts():
+        try:
+            if subprocess.run([path], capture_output=True, timeout=HOLD_TIMEOUT).returncode != 0:
+                return f"{path} says the machine is busy"
+        except subprocess.TimeoutExpired:
+            return f"{path} did not answer within {HOLD_TIMEOUT} s"
+        except OSError as err:
+            return f"{path} cannot run ({err.strerror})"
+    return None
+
+
 def update():
     """Install the latest release from GitHub if it is newer and signed with the release key."""
     settings = read_install_settings()
@@ -1360,10 +1398,11 @@ def update():
         if tests.returncode != 0:
             sys.exit(f"turboctl: release {version} fails its tests on this machine, not installed:\n{tests.stderr}")
         # Installing restarts the service, which turns turbo off for about a second: not during a game.
-        if gamemode_active():
-            print("turboctl: a game runs under GameMode; the update waits for it to end", flush=True)
-            while gamemode_active():
-                time.sleep(GAMEMODE_RETRY)
+        reason = update_hold()
+        if reason:
+            print(f"turboctl: {reason}; the update waits", flush=True)
+            while update_hold():
+                time.sleep(HOLD_RETRY)
         subprocess.run(["sh", "install.sh", "--update"], cwd=source, env=dict(os.environ, **settings), check=True)
     print(f"turboctl updated from {__version__} to {version}")
 
