@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.1
+
+- Intel: an undervolt of 0 mV, the default, made the CPU go back to its factory turbo
+  ratios, while MSR 0x1AD still read the profile's ratios; re-applying the profile did not
+  help. The ratios are now written again after each undervolt write
+
 ## 1.2.0
 
 - Intel: PL2 and the PL1 time window can be set in the custom profile. With the factory

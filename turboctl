@@ -37,7 +37,7 @@ import time
 import urllib.error
 import urllib.request
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 STATE_DIR = "/var/lib/turboctl"
 PROFILE_FILE = STATE_DIR + "/profile"
@@ -946,6 +946,13 @@ def write_undervolt(mv):
         os.close(fd)
     if not mv:
         remove(UNDERVOLT_PENDING)
+    # A 0 mV write brings back the fused turbo ratios, although MSR 0x1AD still reads the
+    # limits written before (seen on an i7-5700HQ). Write them again, through a different
+    # value: the CPU ignores a write of the value the register already holds.
+    if rdmsr(MSR_PLATFORM_INFO) >> 28 & 1:
+        ratios = rdmsr(MSR_TURBO_RATIO_LIMIT)
+        wrmsr(MSR_TURBO_RATIO_LIMIT, ratios - 1 if ratios & 0xFF > 1 else ratios + 1)
+        wrmsr(MSR_TURBO_RATIO_LIMIT, ratios)
 
 
 def checked_undervolt():

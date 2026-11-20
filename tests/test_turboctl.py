@@ -217,6 +217,19 @@ class Undervolt(unittest.TestCase):
         for mv in range(-100, 1):
             self.assertEqual(turboctl.offset_mv(turboctl.offset_units(mv)), mv)
 
+    def test_undervolt_writes_the_ratios_again(self):
+        # A 0 mV write brings back the factory ratios; writing the same 0x1AD value is ignored.
+        writes = []
+        msrs = {turboctl.MSR_PLATFORM_INFO: 1 << 28, turboctl.MSR_TURBO_RATIO_LIMIT: 0x20212223}
+        with mock.patch.object(turboctl, "rdmsr", lambda reg, cpu=0: msrs[reg]), \
+                mock.patch.object(turboctl, "wrmsr", lambda reg, value: writes.append((reg, value))), \
+                mock.patch.object(turboctl, "read_voltage_offset", lambda fd, plane: 0), \
+                mock.patch.object(turboctl, "UNDERVOLT_PENDING", "/nonexistent/pending"), \
+                mock.patch("os.open", return_value=-1), mock.patch("os.pwrite"), mock.patch("os.close"):
+            turboctl.write_undervolt(0)
+        ratio = turboctl.MSR_TURBO_RATIO_LIMIT
+        self.assertEqual(writes, [(ratio, 0x20212222), (ratio, 0x20212223)])
+
     def test_valid_undervolt(self):
         self.assertEqual([turboctl.valid_undervolt(v) for v in (0, -100, -50)], [True] * 3)
         self.assertEqual([turboctl.valid_undervolt(v) for v in (1, -101, -50.0, True, "-50")], [False] * 5)
