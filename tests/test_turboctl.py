@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -375,8 +376,15 @@ class Update(unittest.TestCase):
                                  gamemode_active=lambda: self.games.pop(0) if self.games else False,
                                  UPDATE_HOLD_DIR=self.hold), \
                 mock.patch.object(turboctl.subprocess, "run", run), mock.patch("builtins.print"), \
-                mock.patch.object(turboctl.time, "sleep", lambda seconds: self.sleeps.append(seconds)):
+                mock.patch.object(turboctl.time, "sleep", self.sleep):
             turboctl.update()
+
+    def sleep(self, seconds, real_sleep=time.sleep):
+        # subprocess also sleeps while it waits for a script with a timeout: only the update's waits are skipped.
+        if seconds == turboctl.HOLD_RETRY:
+            self.sleeps.append(seconds)
+        else:
+            real_sleep(seconds)
 
     def test_installs_a_newer_signed_release(self):
         self.run_update(self.release("99.0.0"))
