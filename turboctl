@@ -39,7 +39,7 @@ import time
 import urllib.error
 import urllib.request
 
-__version__ = "1.3.1"
+__version__ = "1.3.2"
 
 STATE_DIR = "/var/lib/turboctl"
 PROFILE_FILE = STATE_DIR + "/profile"
@@ -1282,7 +1282,8 @@ def set_update_interval(interval):
     write_text(UPDATE_INTERVAL_FILE, interval + "\n")
     if calendar:
         os.makedirs(os.path.dirname(UPDATE_TIMER_DROPIN), exist_ok=True)
-        write_text(UPDATE_TIMER_DROPIN, f"[Timer]\nOnCalendar=\nOnCalendar={calendar}\n")
+        # An empty OnCalendar= clears every trigger of the timer, OnBootSec too: set it again.
+        write_text(UPDATE_TIMER_DROPIN, f"[Timer]\nOnCalendar=\nOnBootSec=5min\nOnCalendar={calendar}\n")
     else:
         remove(UPDATE_TIMER_DROPIN)
     # The preset keeps the choice when the distribution resets services to their presets.

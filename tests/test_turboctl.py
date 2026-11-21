@@ -498,6 +498,9 @@ class UpdateInterval(unittest.TestCase):
         turboctl.set_update_interval("weekly")
         self.assertEqual(turboctl.saved_update_interval(), "weekly")
         self.assertIn("OnCalendar=weekly", self.read("UPDATE_TIMER_DROPIN"))
+        # The empty OnCalendar= also clears OnBootSec, which must come back after it.
+        dropin = self.read("UPDATE_TIMER_DROPIN").splitlines()
+        self.assertGreater(dropin.index("OnBootSec=5min"), dropin.index("OnCalendar="))
         self.assertEqual(self.read("UPDATE_PRESET"), "enable turboctl-update.timer\n")
         self.assertEqual(self.calls[-1], ["restart", "turboctl-update.timer"])
 

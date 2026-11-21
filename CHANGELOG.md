@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.2
+
+- The check after each boot never ran since 1.1.1: the interval setting cleared it.
+  It runs again, 5 minutes to an hour after boot. Run `sudo turboctl update` once to
+  get this release; the interval setting is rewritten by the update
+
 ## 1.3.1
 
 - Updates also wait while a script in `/etc/turboctl/update-hold.d/` says the machine is
